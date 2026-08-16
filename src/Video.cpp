@@ -77,9 +77,8 @@ void Video::video_refresh(void *arg, double *remaining_time)
 retry:
         if (frame_queue_nb_remaining(&videostate->pictq) == 0) {
             // nothing to do, no picture to display in the queue
-            update_imgui(renderer, videostate->width, videostate->height);
             SDL_RenderPresent(renderer);
-        } 
+        }
         else {
             double last_duration, duration, delay;
             Frame *vp, *lastvp;
@@ -214,13 +213,12 @@ void Video::update_video_pts(VideoState *videostate, double pts, int64_t pos, in
 
 void Video::video_display(VideoState *videostate)
 {
-    if (!videostate->width)
+    if (!videostate->window_opened)
         video_open(videostate);
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
     if (videostate->video_st)
         video_image_display(videostate);
-    update_imgui(renderer, videostate->width, videostate->height);
     SDL_RenderPresent(renderer);
 }
 
@@ -245,6 +243,7 @@ int Video::video_open(VideoState *videostate)
 
     videostate->width  = w;
     videostate->height = h;
+    videostate->window_opened = 1;
 
     return 0;
 }
@@ -340,7 +339,9 @@ void Video::video_image_display(VideoState *videostate)
         }
     }
 
-    Window::calculate_display_rect(&rect, videostate->xleft, videostate->ytop, videostate->width, videostate->height, vp->width, vp->height, vp->sar);
+    int out_w, out_h;
+    SDL_GetRendererOutputSize(renderer, &out_w, &out_h);
+    Window::calculate_display_rect(&rect, videostate->xleft, videostate->ytop, out_w, out_h, vp->width, vp->height, vp->sar);
 
     if (!vp->uploaded) {
         if (upload_texture(&videostate->vid_texture, vp->frame, &videostate->img_convert_ctx) < 0)

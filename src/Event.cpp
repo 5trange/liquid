@@ -5,17 +5,9 @@
 #include "Stream.hpp"
 
 int step;
-int is_ui_init = 0;
 double pos;
 double incr;
 double frac;
-double seek_time;
-double master_clock;
-SDL_TimerID ui_draw_timer;
-
-std::string current_hour;
-std::string current_min;
-std::string current_sec;
 
 void Event::event_loop(VideoState *videostate)
 {
@@ -114,28 +106,22 @@ void Event::event_loop(VideoState *videostate)
             }
             break;
         case SDL_MOUSEBUTTONDOWN:
-            if(!want_capture_mouse())
-            {
-                if (exit_on_mousedown) {
-                    do_exit(videostate);
-                    break;
-                }
-                if (event.button.button == SDL_BUTTON_LEFT) {
-                    static int64_t last_mouse_left_click = 0;
-                    if (av_gettime_relative() - last_mouse_left_click <= 500000) {
-                        Event::toggle_full_screen(videostate);
-                        videostate->force_refresh = 1;
-                        last_mouse_left_click = 0;
-                    } else {
-                        last_mouse_left_click = av_gettime_relative();
-                    }
+            if (exit_on_mousedown) {
+                do_exit(videostate);
+                break;
+            }
+            if (event.button.button == SDL_BUTTON_LEFT) {
+                static int64_t last_mouse_left_click = 0;
+                if (av_gettime_relative() - last_mouse_left_click <= 500000) {
+                    Event::toggle_full_screen(videostate);
+                    videostate->force_refresh = 1;
+                    last_mouse_left_click = 0;
+                } else {
+                    last_mouse_left_click = av_gettime_relative();
                 }
             }
         case SDL_MOUSEMOTION:
-            SDL_RemoveTimer(ui_draw_timer);
-            draw_ui = true;
             cursor_hidden = 1;
-            ui_draw_timer = SDL_AddTimer(3000, Event::hide_ui, (void *)false);
             if (cursor_hidden) {
                 SDL_ShowCursor(SDL_ENABLE);
                 cursor_hidden = 0;
@@ -191,7 +177,6 @@ void Event::event_loop(VideoState *videostate)
         default:
             break;
         }
-        imgui_event_handler(event);
     }
 }
 
@@ -214,82 +199,9 @@ void Event::refresh_loop_wait_event(VideoState *videostate, SDL_Event *event)
         if(videostate->paused){
             if (videostate->video_st)
                 Video::video_image_display(videostate);
-            
-            update_imgui(renderer, videostate->width, videostate->height);
             SDL_RenderPresent(renderer);
         }
 
-        // Handle UI events
-        if(req_pause){
-            Event::toggle_pause(videostate);
-            req_pause = false;
-        }
-
-        if(req_seek){
-            SeekPause::execute_seek(videostate, ui_incr);
-            req_seek = false;
-        }
-
-        if(req_mute){
-            Event::toggle_mute(videostate);
-            req_mute = false;
-        }
-
-        if(req_audio_track_change){
-            Event::stream_cycle_channel(videostate, AVMEDIA_TYPE_AUDIO);
-            req_audio_track_change = false;
-        }
-
-        if(req_sub_track_change){
-            Event::stream_cycle_channel(videostate, AVMEDIA_TYPE_SUBTITLE);
-            req_sub_track_change = false;
-        }
-
-        if(req_seek_progress){
-            seek_time = ((progress_var * avformat_ctx->duration/1000000)/100);
-            master_clock = Clock::get_master_clock(videostate);
-            if(seek_time < master_clock){
-                seek_time = master_clock - seek_time;
-                SeekPause::execute_seek(videostate, -seek_time);
-            }   
-            else if(seek_time > master_clock){
-                seek_time = seek_time - master_clock;
-                SeekPause::execute_seek(videostate, seek_time);
-            }
-            req_seek_progress = !req_seek_progress;
-        }
-
-        if(vol_change){
-            videostate->audio_volume = sound_var;
-            vol_change = false;
-        }
-
-        // Calculate clock values
-        if(Clock::get_master_clock(videostate) <= (double)avformat_ctx->duration/1000000){
-            cur_hur = Clock::get_master_clock(videostate)/3600;
-            cur_tim = ((int)Clock::get_master_clock(videostate))%3600;
-            cur_min = cur_tim/60;
-            cur_tim = ((int)cur_tim)%60;
-            cur_sec = cur_tim;
-        }
-        
-        if (cur_hur < 10)
-            current_hour = "0" + std::to_string(cur_hur);
-        else
-            current_hour = std::to_string(cur_hur);
-
-        if(cur_min < 10)
-            current_min = "0" + std::to_string(cur_min);
-        else
-            current_min = std::to_string(cur_min);
-
-        if(cur_sec < 10)
-            current_sec = "0" + std::to_string(cur_sec);
-        else
-            current_sec = std::to_string(cur_sec);
-
-        current_time = current_hour + ":" + current_min + ":" + current_sec;
-        progress_var = (float)(Clock::get_master_clock(videostate) * 100 ) / ((double)avformat_ctx->duration/1000000);
         SDL_PumpEvents();
     }
 }
@@ -321,9 +233,6 @@ void Event::update_volume(VideoState *videostate)
         // Increase volume
         videostate->audio_volume++;
     }
-    
-    // Update UI sound var
-    sound_var = videostate->audio_volume;
 
     step = 0;
 }
@@ -383,7 +292,7 @@ void Event::stream_cycle_channel(VideoState *videostate, int codec_type)
             switch (codec_type) {
             case AVMEDIA_TYPE_AUDIO:
                 if (st->codecpar->sample_rate != 0 &&
-                    st->codecpar->channels != 0)
+                    st->codecpar->ch_layout.nb_channels != 0)
                     goto the_end;
                 break;
             case AVMEDIA_TYPE_VIDEO:
@@ -427,11 +336,4 @@ void Event::seek_chapter(VideoState *videostate, int incr)
     std::cout<<"LOG: Seeking to chapter "<<i<<std::endl;
     SeekPause::stream_seek(videostate, av_rescale_q(videostate->ic->chapters[i]->start, videostate->ic->chapters[i]->time_base,
                                  AV_TIME_BASE_Q), 0, 0);
-}
-
-Uint32 Event::hide_ui(Uint32 interval,void* param)
-{
-    draw_ui = false;
-    SDL_ShowCursor(SDL_DISABLE);
-    return 0;
 }

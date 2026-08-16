@@ -49,8 +49,6 @@ int screen_left = SDL_WINDOWPOS_CENTERED;
 int screen_top = SDL_WINDOWPOS_CENTERED;
 
 AVFormatContext* avformat_ctx;
-std::string current_time;
-std::string max_video_duration;
 SDL_RendererFlip need_flip;
 
 SDL_Window *window;
@@ -81,7 +79,6 @@ void do_exit(VideoState *videostate)
     if (window)
         SDL_DestroyWindow(window);
 
-    destroy_imgui_data();
     SDL_Quit();
     exit(0);
 }

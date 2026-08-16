@@ -55,8 +55,6 @@ int Thread::read_thread(void *arg)
     if (genpts)
         ic->flags |= AVFMT_FLAG_GENPTS;
 
-    av_format_inject_global_side_data(ic);
-
     if (find_stream_info){
         int orig_nb_streams = ic->nb_streams;
 
@@ -322,7 +320,8 @@ int Thread::video_thread(void *arg)
 
         duration = (frame_rate.num && frame_rate.den ? av_q2d((AVRational){frame_rate.den, frame_rate.num}) : 0);
         pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
-        ret = Video::queue_picture(videostate, frame, pts, duration, frame->pkt_pos, videostate->viddec.pkt_serial);
+        /* AVFrame::pkt_pos was removed upstream with no replacement */
+        ret = Video::queue_picture(videostate, frame, pts, duration, -1, videostate->viddec.pkt_serial);
         av_frame_unref(frame);
 
         if (ret < 0)
@@ -356,7 +355,7 @@ int Thread::audio_thread(void *arg)
                 goto the_end;
 
             af->pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
-            af->pos = frame->pkt_pos;
+            af->pos = -1; /* AVFrame::pkt_pos was removed upstream with no replacement */
             af->serial = videostate->auddec.pkt_serial;
             af->duration = av_q2d((AVRational){frame->nb_samples, frame->sample_rate});
 

@@ -19,10 +19,9 @@ int Window::create_window(){
         SDL_RENDERER_PRESENTVSYNC
     );
     if (!window || !renderer){
-        return -1; 
+        return -1;
     }
-    init_imgui(window,renderer);
-    
+
     return 0;
 }
 

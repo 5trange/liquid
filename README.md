@@ -13,21 +13,21 @@ Lightweight media player written in C++ using FFmpeg and SDL2. Currently in deve
 
 Install the necessary packages using PACMAN:
 ```
-sudo pacman -S --needed base-devel make cmake ninja ffmpeg
+sudo pacman -S --needed base-devel make cmake ninja ffmpeg sdl2
 ```
 
 #### RPM based distributions(Fedora, RHEL, etc.):
 
 Install the necessary packages using DNF(Incomplete list):
 ```
-sudo dnf install ffmpeg ffmpeg-devel g++ gdb mesa-libGL-devel mesa-libGLU-devel mesa-libGLw-devel mesa-libOSMesa-devel libXext-devel alsa-lib-devel make cmake ninja-build
+sudo dnf install ffmpeg ffmpeg-devel g++ gdb mesa-libGL-devel mesa-libGLU-devel mesa-libGLw-devel mesa-libOSMesa-devel libXext-devel alsa-lib-devel make cmake ninja-build SDL2-devel
 ```
 
 #### Debian based distributions:
 
 Install the necessary packages using APT:
 ```
-sudo apt install ffmpeg libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev libavutil-dev libswresample-dev libswscale-dev make cmake ninja-build
+sudo apt install ffmpeg libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev libavutil-dev libswresample-dev libswscale-dev libsdl2-dev make cmake ninja-build
 ```
 
 #### Void Linux
@@ -35,6 +35,43 @@ sudo apt install ffmpeg libavcodec-dev libavformat-dev libavfilter-dev libavdevi
 Install the necessary packages using XBPS:
 ```
 sudo xbps-install cmake make ninja ffmpeg ffmpeg-devel pkg-config gdb SDL2-devel
+```
+
+### Building
+
+To build the project:
+
+ninja:
+```
+make build_ninja
+```
+or
+
+make
+```
+make build_make
+```
+
+### Install
+
+To Install to local binary:
+
+ninja:
+```
+make install_ninja
+```
+make:
+```
+make install_make
+```
+
+## macOS
+
+### Installing Dependency
+
+Install the necessary packages using [Homebrew](https://brew.sh/ "Homebrew Homepage"):
+```
+brew install cmake ninja pkg-config ffmpeg sdl2
 ```
 
 ### Building
@@ -78,7 +115,7 @@ pacman -Syu
 Then install the necessary packages through Pacman by using:
 
 ```
-pacman -Syu --needed mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-ffmpeg mingw-w64-x86_64-toolchain
+pacman -Syu --needed mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-ffmpeg mingw-w64-x86_64-toolchain mingw-w64-x86_64-SDL2
 ```
 Add the MSYS2 paths to your system environment variables.
 

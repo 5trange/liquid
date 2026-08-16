@@ -4,7 +4,6 @@
 **  Includes
 */
 
-#include "UI.hpp"
 #include "queue/packetqueue.hpp"
 #include "queue/framequeue.hpp"
 
@@ -57,8 +56,7 @@ static unsigned sws_flags = SWS_LANCZOS;
 
 struct AudioParams{
     int freq;
-    int channels;
-    int64_t channel_layout;
+    AVChannelLayout ch_layout;
     enum AVSampleFormat fmt;
     int frame_size;
     int bytes_per_sec;
@@ -168,9 +166,6 @@ struct VideoState {
     int16_t sample_array[SAMPLE_ARRAY_SIZE];
     int sample_array_index;
     int last_i_start;
-    RDFTContext *rdft;
-    int rdft_bits;
-    FFTSample *rdft_data;
     int xpos;
     double last_vis_time;
     SDL_Texture *sub_texture;
@@ -193,6 +188,7 @@ struct VideoState {
 
     char *filename;
     int width, height, xleft, ytop;
+    int window_opened;
     int step;
 
     int last_video_stream, last_audio_stream, last_subtitle_stream;
@@ -241,7 +237,6 @@ extern int64_t cursor_last_shown;
 extern int display_disable;
 extern int screen_left;
 extern int screen_top;
-extern int is_ui_init;
 extern double pos;
 extern double incr;
 extern double frac;

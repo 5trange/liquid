@@ -2,24 +2,26 @@
 #include "utils/Clock.hpp"
 #include "Window.hpp"
 
-int Audio::audio_open(void *opaque, int64_t wanted_channel_layout, int wanted_nb_channels, int wanted_sample_rate, struct AudioParams *audio_hw_params)
+int Audio::audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int wanted_sample_rate, struct AudioParams *audio_hw_params)
 {
     SDL_AudioSpec wanted_spec, spec;
     const char *env;
     static const int next_nb_channels[] = {0, 0, 1, 6, 2, 6, 4, 6};
     static const int next_sample_rates[] = {0, 44100, 48000, 96000, 192000};
     int next_sample_rate_idx = FF_ARRAY_ELEMS(next_sample_rates) - 1;
+    int wanted_nb_channels = wanted_channel_layout->nb_channels;
 
     env = SDL_getenv("SDL_AUDIO_CHANNELS");
     if (env) {
         wanted_nb_channels = atoi(env);
-        wanted_channel_layout = av_get_default_channel_layout(wanted_nb_channels);
+        av_channel_layout_uninit(wanted_channel_layout);
+        av_channel_layout_default(wanted_channel_layout, wanted_nb_channels);
     }
-    if (!wanted_channel_layout || wanted_nb_channels != av_get_channel_layout_nb_channels(wanted_channel_layout)) {
-        wanted_channel_layout = av_get_default_channel_layout(wanted_nb_channels);
-        wanted_channel_layout &= ~AV_CH_LAYOUT_STEREO_DOWNMIX;
+    if (wanted_channel_layout->order != AV_CHANNEL_ORDER_NATIVE) {
+        av_channel_layout_uninit(wanted_channel_layout);
+        av_channel_layout_default(wanted_channel_layout, wanted_nb_channels);
     }
-    wanted_nb_channels = av_get_channel_layout_nb_channels(wanted_channel_layout);
+    wanted_nb_channels = wanted_channel_layout->nb_channels;
     wanted_spec.channels = wanted_nb_channels;
     wanted_spec.freq = wanted_sample_rate;
     if (wanted_spec.freq <= 0 || wanted_spec.channels <= 0) {
@@ -43,15 +45,16 @@ int Audio::audio_open(void *opaque, int64_t wanted_channel_layout, int wanted_nb
                 return -1;
             }
         }
-        wanted_channel_layout = av_get_default_channel_layout(wanted_spec.channels);
+        av_channel_layout_default(wanted_channel_layout, wanted_spec.channels);
     }
     if (spec.format != AUDIO_S16SYS) {
         std::cout<<"SDL adviced audio format is not supported: "<<spec.format<<std::endl;
         return -1;
     }
     if (spec.channels != wanted_spec.channels) {
-        wanted_channel_layout = av_get_default_channel_layout(spec.channels);
-        if (!wanted_channel_layout) {
+        av_channel_layout_uninit(wanted_channel_layout);
+        av_channel_layout_default(wanted_channel_layout, spec.channels);
+        if (wanted_channel_layout->order != AV_CHANNEL_ORDER_NATIVE) {
             std::cout<<"SDL adviced channel layout is not supported: "<<spec.channels<<std::endl;
             return -1;
         }
@@ -59,10 +62,10 @@ int Audio::audio_open(void *opaque, int64_t wanted_channel_layout, int wanted_nb
 
     audio_hw_params->fmt = AV_SAMPLE_FMT_S16;
     audio_hw_params->freq = spec.freq;
-    audio_hw_params->channel_layout = wanted_channel_layout;
-    audio_hw_params->channels =  spec.channels;
-    audio_hw_params->frame_size = av_samples_get_buffer_size(NULL, audio_hw_params->channels, 1, audio_hw_params->fmt, 1);
-    audio_hw_params->bytes_per_sec = av_samples_get_buffer_size(NULL, audio_hw_params->channels, audio_hw_params->freq, audio_hw_params->fmt, 1);
+    if (av_channel_layout_copy(&audio_hw_params->ch_layout, wanted_channel_layout) < 0)
+        return -1;
+    audio_hw_params->frame_size = av_samples_get_buffer_size(NULL, audio_hw_params->ch_layout.nb_channels, 1, audio_hw_params->fmt, 1);
+    audio_hw_params->bytes_per_sec = av_samples_get_buffer_size(NULL, audio_hw_params->ch_layout.nb_channels, audio_hw_params->freq, audio_hw_params->fmt, 1);
     if (audio_hw_params->bytes_per_sec <= 0 || audio_hw_params->frame_size <= 0) {
         std::cout<<"FATAL ERROR: av_samples_get_buffer_size() failed!"<<std::endl;
         return -1;
@@ -116,7 +119,6 @@ void Audio::sdl_audio_callback(void *opaque, Uint8 *stream, int len)
 int Audio::audio_decode_frame(VideoState *videostate)
 {
     int data_size, resampled_data_size;
-    int64_t dec_channel_layout;
     av_unused double audio_clock0;
     int wanted_nb_samples;
     Frame *af;
@@ -140,42 +142,40 @@ int Audio::audio_decode_frame(VideoState *videostate)
     } while (af->serial != videostate->audioq.serial);
 
     data_size = av_samples_get_buffer_size(
-        NULL, 
-        af->frame->channels,
+        NULL,
+        af->frame->ch_layout.nb_channels,
         af->frame->nb_samples,
         static_cast<AVSampleFormat>(af->frame->format),
         1
     );
 
-    dec_channel_layout =
-        (af->frame->channel_layout && af->frame->channels == av_get_channel_layout_nb_channels(af->frame->channel_layout)) ?
-        af->frame->channel_layout : av_get_default_channel_layout(af->frame->channels);
     wanted_nb_samples = Audio::synchronize_audio(videostate, af->frame->nb_samples);
 
-    if (af->frame->format        != videostate->audio_src.fmt            ||
-        dec_channel_layout       != videostate->audio_src.channel_layout ||
-        af->frame->sample_rate   != videostate->audio_src.freq           ||
+    if (af->frame->format        != videostate->audio_src.fmt ||
+        av_channel_layout_compare(&af->frame->ch_layout, &videostate->audio_src.ch_layout) ||
+        af->frame->sample_rate   != videostate->audio_src.freq ||
         (wanted_nb_samples       != af->frame->nb_samples && !videostate->swr_ctx)) {
+        int ret;
         swr_free(&videostate->swr_ctx);
-        videostate->swr_ctx = swr_alloc_set_opts(
-            NULL,
-            videostate->audio_tgt.channel_layout, 
+        ret = swr_alloc_set_opts2(
+            &videostate->swr_ctx,
+            &videostate->audio_tgt.ch_layout,
             videostate->audio_tgt.fmt,
             videostate->audio_tgt.freq,
-            dec_channel_layout,         
+            &af->frame->ch_layout,
             static_cast<AVSampleFormat>(af->frame->format),
             af->frame->sample_rate,
-            0, 
+            0,
             NULL
         );
-        if (!videostate->swr_ctx || swr_init(videostate->swr_ctx) < 0)
+        if (ret < 0 || swr_init(videostate->swr_ctx) < 0)
         {
             std::cout<<"ERROR: Could not create audio resampler context!"<<std::endl;
             swr_free(&videostate->swr_ctx);
             return -1;
         }
-        videostate->audio_src.channel_layout = dec_channel_layout;
-        videostate->audio_src.channels       = af->frame->channels;
+        if (av_channel_layout_copy(&videostate->audio_src.ch_layout, &af->frame->ch_layout) < 0)
+            return -1;
         videostate->audio_src.freq = af->frame->sample_rate;
         videostate->audio_src.fmt = static_cast<AVSampleFormat>(af->frame->format);
     }
@@ -184,7 +184,7 @@ int Audio::audio_decode_frame(VideoState *videostate)
         const uint8_t **in = (const uint8_t **)af->frame->extended_data;
         uint8_t **out = &videostate->audio_buf1;
         int out_count = (int64_t)wanted_nb_samples * videostate->audio_tgt.freq / af->frame->sample_rate + 256;
-        int out_size  = av_samples_get_buffer_size(NULL, videostate->audio_tgt.channels, out_count, videostate->audio_tgt.fmt, 0);
+        int out_size  = av_samples_get_buffer_size(NULL, videostate->audio_tgt.ch_layout.nb_channels, out_count, videostate->audio_tgt.fmt, 0);
         int len2;
         if (out_size < 0) {
             std::cout<<"FATAL ERROR: av_samples_get_buffer_size() failed!"<<std::endl;
@@ -211,7 +211,7 @@ int Audio::audio_decode_frame(VideoState *videostate)
                 swr_free(&videostate->swr_ctx);
         }
         videostate->audio_buf = videostate->audio_buf1;
-        resampled_data_size = len2 * videostate->audio_tgt.channels * av_get_bytes_per_sample(videostate->audio_tgt.fmt);
+        resampled_data_size = len2 * videostate->audio_tgt.ch_layout.nb_channels * av_get_bytes_per_sample(videostate->audio_tgt.fmt);
     } else {
         videostate->audio_buf = af->frame->data[0];
         resampled_data_size = data_size;
