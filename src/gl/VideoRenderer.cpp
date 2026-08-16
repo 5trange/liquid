@@ -9,6 +9,7 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <cstdio>
 
 namespace {
 
@@ -25,7 +26,12 @@ const char *vertex_src =
 // Decode pass: YUV420P -> RGB. uYuvMode: 0 = BT.601 limited range
 // (default), 1 = BT.601 full range (JPEG), 2 = BT.709 limited range. uFlipV
 // resolves bottom-up (negative linesize) frames here, once, so every later
-// pass can assume a normal top-down image.
+// pass can assume a normal top-down image. uBitScale renormalizes 10-bit
+// planes: they're uploaded as raw 16-bit words with the true sample in the
+// low 10 bits (see ensure_yuv_textures/upload_frame), so a plain GL_R16
+// sample reads as trueCode/65535 instead of trueCode/1023 - multiplying by
+// 65535/1023 here (1.0 for 8-bit content) recovers the correctly normalized
+// value before any of the matrix math below, uniformly for y/u/v.
 const char *fragment_src_decode_yuv =
     "#version 330 core\n"
     "in vec2 vTexCoord;\n"
@@ -35,11 +41,12 @@ const char *fragment_src_decode_yuv =
     "uniform sampler2D uTexV;\n"
     "uniform int uYuvMode;\n"
     "uniform bool uFlipV;\n"
+    "uniform float uBitScale;\n"
     "void main() {\n"
     "    vec2 uv = uFlipV ? vec2(vTexCoord.x, 1.0 - vTexCoord.y) : vTexCoord;\n"
-    "    float y = texture(uTexY, uv).r;\n"
-    "    float u = texture(uTexU, uv).r;\n"
-    "    float v = texture(uTexV, uv).r;\n"
+    "    float y = texture(uTexY, uv).r * uBitScale;\n"
+    "    float u = texture(uTexU, uv).r * uBitScale;\n"
+    "    float v = texture(uTexV, uv).r * uBitScale;\n"
     "    vec3 rgb;\n"
     "    if (uYuvMode == 1) {\n"
     "        float d = u - 0.50196078;\n"
@@ -58,6 +65,97 @@ const char *fragment_src_decode_yuv =
     "        }\n"
     "    }\n"
     "    FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);\n"
+    "}\n";
+
+// HDR decode pass: BT.2020 limited-range YUV -> tone-mapped SDR RGB. Used
+// instead of fragment_src_decode_yuv when the source frame's color_trc is
+// PQ (ST.2084) or HLG (ARIB STD-B67) - see upload_frame. This GL 3.3 core
+// context has no HDR-capable swapchain (see Window.cpp), so there's no such
+// thing as "real" HDR output here; this produces a correctly tone-mapped
+// SDR image instead of running PQ/HLG code values through the SDR matrix as
+// if they were gamma-encoded already (which is what happened before this
+// shader existed, and is why HDR content looked washed out/wrong).
+//
+// Everything here is a deliberately simple, real-time-shader-friendly
+// approximation rather than a frame-accurate reference implementation:
+//  - BT.2020 non-constant-luminance matrix, reusing the existing 8-bit
+//    limited-range black/chroma-center constants (off by <0.001 for 10-bit
+//    content - not worth a second set of constants).
+//  - No mastering-display metadata is read, so tone-mapping assumes a
+//    generic ~1000-nit-mastered source and maps it down to a 203-nit SDR
+//    reference white (ITU-R BT.2408) with an extended-Reinhard curve on
+//    luma (hue-preserving, monotonic, matches BT.2390's goal of preserving
+//    shadows/midtones while smoothly compressing highlights without being
+//    a byte-for-byte port of the BT.2390 EETF spline).
+//  - HLG's OOTF (which is properly luminance-based, scaling all three
+//    channels by a single system-gamma factor derived from scene
+//    luminance) is approximated per-channel here for simplicity; this can
+//    introduce a small hue shift on saturated HLG highlights. PQ (by far
+//    the common case for HDR10 video) has no such approximation.
+const char *fragment_src_decode_yuv_hdr =
+    "#version 330 core\n"
+    "in vec2 vTexCoord;\n"
+    "out vec4 FragColor;\n"
+    "uniform sampler2D uTexY;\n"
+    "uniform sampler2D uTexU;\n"
+    "uniform sampler2D uTexV;\n"
+    "uniform int uHdrMode;\n" // 1 = PQ (ST.2084), 2 = HLG (ARIB STD-B67)
+    "uniform bool uFlipV;\n"
+    "uniform float uBitScale;\n"
+    "float pq_eotf(float N) {\n"
+    "    float m1 = 0.1593017578125, m2 = 78.84375;\n"
+    "    float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n"
+    "    float Np = pow(max(N, 0.0), 1.0 / m2);\n"
+    "    float num = max(Np - c1, 0.0);\n"
+    "    float den = max(c2 - c3 * Np, 1e-6);\n"
+    "    return pow(num / den, 1.0 / m1);\n"
+    "}\n"
+    "float hlg_inv_oetf(float E) {\n"
+    "    float a = 0.17883277, b = 0.28466892, c = 0.55991073;\n"
+    "    return (E <= 0.5) ? (E * E) / 3.0 : (exp((E - c) / a) + b) / 12.0;\n"
+    "}\n"
+    "vec3 tonemap(vec3 c) {\n"
+    "    float maxWhite = 4.0;\n" // ~800 nits before full compression, on top of a 203-nit reference white
+    "    float l = dot(c, vec3(0.2627, 0.6780, 0.0593));\n"
+    "    if (l <= 0.0) return vec3(0.0);\n"
+    "    float lOut = (l * (1.0 + l / (maxWhite * maxWhite))) / (1.0 + l);\n"
+    "    return c * (lOut / l);\n"
+    "}\n"
+    "float srgb_oetf(float c) {\n"
+    "    c = clamp(c, 0.0, 1.0);\n"
+    "    return (c <= 0.0031308) ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;\n"
+    "}\n"
+    "void main() {\n"
+    "    vec2 uv = uFlipV ? vec2(vTexCoord.x, 1.0 - vTexCoord.y) : vTexCoord;\n"
+    "    float y = texture(uTexY, uv).r * uBitScale;\n"
+    "    float u = texture(uTexU, uv).r * uBitScale;\n"
+    "    float v = texture(uTexV, uv).r * uBitScale;\n"
+    "    float yl = (y - 0.06274510) * 1.164384;\n"
+    "    float d = u - 0.50196078;\n"
+    "    float e = v - 0.50196078;\n"
+    // BT.2020 non-constant-luminance matrix.
+    "    vec3 rgb2020 = vec3(\n"
+    "        yl + 1.4746 * e,\n"
+    "        yl - 0.16455 * d - 0.57135 * e,\n"
+    "        yl + 1.8814 * d);\n"
+    "    rgb2020 = max(rgb2020, vec3(0.0));\n"
+    "    vec3 lin;\n" // scene/display-linear, normalized so 1.0 == 203 nits (BT.2408 SDR reference white)
+    "    if (uHdrMode == 2) {\n"
+    "        float gamma = 1.2;\n" // BT.2100 reference system gamma for a nominal 1000-nit HLG peak
+    "        vec3 sceneLin = vec3(hlg_inv_oetf(rgb2020.r), hlg_inv_oetf(rgb2020.g), hlg_inv_oetf(rgb2020.b));\n"
+    "        lin = pow(sceneLin, vec3(gamma)) * (1000.0 / 203.0);\n"
+    "    } else {\n"
+    "        vec3 nits = vec3(pq_eotf(rgb2020.r), pq_eotf(rgb2020.g), pq_eotf(rgb2020.b)) * 10000.0;\n"
+    "        lin = nits / 203.0;\n"
+    "    }\n"
+    "    vec3 sdrLin = tonemap(lin);\n"
+    // BT.2020 -> BT.709/sRGB primaries (linear light).
+    "    vec3 rgb709 = vec3(\n"
+    "         1.6605 * sdrLin.r - 0.5876 * sdrLin.g - 0.0728 * sdrLin.b,\n"
+    "        -0.1246 * sdrLin.r + 1.1329 * sdrLin.g - 0.0083 * sdrLin.b,\n"
+    "        -0.0182 * sdrLin.r - 0.1006 * sdrLin.g + 1.1187 * sdrLin.b);\n"
+    "    vec3 outc = vec3(srgb_oetf(rgb709.r), srgb_oetf(rgb709.g), srgb_oetf(rgb709.b));\n"
+    "    FragColor = vec4(outc, 1.0);\n"
     "}\n";
 
 const char *fragment_src_decode_rgba =
@@ -523,6 +621,7 @@ const char *fragment_src_flat =
     "}\n";
 
 GLuint g_program_decode_yuv = 0;
+GLuint g_program_decode_yuv_hdr = 0;
 GLuint g_program_decode_rgba = 0;
 GLuint g_program_easu = 0;
 GLuint g_program_rcas = 0;
@@ -531,7 +630,9 @@ GLuint g_program_text = 0;
 GLuint g_program_flat = 0;
 
 GLint g_loc_decode_yuv_tex_y = -1, g_loc_decode_yuv_tex_u = -1, g_loc_decode_yuv_tex_v = -1;
-GLint g_loc_decode_yuv_mode = -1, g_loc_decode_yuv_flip = -1;
+GLint g_loc_decode_yuv_mode = -1, g_loc_decode_yuv_flip = -1, g_loc_decode_yuv_bitscale = -1;
+GLint g_loc_decode_hdr_tex_y = -1, g_loc_decode_hdr_tex_u = -1, g_loc_decode_hdr_tex_v = -1;
+GLint g_loc_decode_hdr_mode = -1, g_loc_decode_hdr_flip = -1, g_loc_decode_hdr_bitscale = -1;
 GLint g_loc_decode_rgba_tex = -1, g_loc_decode_rgba_flip = -1;
 GLint g_loc_easu_tex = -1, g_loc_easu_src_size = -1, g_loc_easu_texel_size = -1;
 GLint g_loc_rcas_tex = -1, g_loc_rcas_texel_size = -1, g_loc_rcas_sharpness = -1;
@@ -550,6 +651,8 @@ GLuint g_vao_text = 0, g_vbo_text = 0;       // dynamic glyph quads for the over
 GLuint g_vao_box = 0, g_vbo_box = 0;         // background box behind the overlay text
 GLuint g_vao_help_text = 0, g_vbo_help_text = 0; // glyph quads for the help panel
 GLuint g_vao_help_box = 0, g_vbo_help_box = 0;   // background box behind the help panel
+GLuint g_vao_stats_text = 0, g_vbo_stats_text = 0; // glyph quads for the stats panel
+GLuint g_vao_stats_box = 0, g_vbo_stats_box = 0;   // background box behind the stats panel
 
 GLuint g_tex_y = 0, g_tex_u = 0, g_tex_v = 0;
 int g_y_w = 0, g_y_h = 0;
@@ -560,6 +663,10 @@ int g_rgba_w = 0, g_rgba_h = 0;
 
 bool g_using_yuv = true;
 int g_yuv_mode = 0;
+bool g_yuv_10bit = false;   // current g_tex_y/u/v format: GL_R16 vs GL_R8
+float g_yuv_bit_scale = 1.0f; // see fragment_src_decode_yuv's uBitScale comment
+bool g_yuv_hdr = false;     // true: last uploaded frame needs fragment_src_decode_yuv_hdr
+int g_yuv_hdr_trc = 1;      // 1 = PQ, 2 = HLG (only meaningful when g_yuv_hdr)
 
 GLuint g_fbo_decode = 0, g_tex_decode = 0;
 int g_decode_w = 0, g_decode_h = 0;
@@ -609,6 +716,7 @@ const char *kHelpLines[] = {
     "C             Cycle all tracks",
     "U             Cycle upscaler",
     "R             Cycle scale preset",
+    "I             Toggle decode stats",
     "Left / Right  Seek -10s / +10s",
     "Up / Down     Seek +60s / -60s",
     "PageUp/Down   Next / prev chapter",
@@ -620,6 +728,17 @@ bool g_help_active = false;
 int g_help_char_count = 0;
 int g_help_box_w = 0, g_help_box_h = 0;
 
+// Stats panel: same box/text building blocks as the help panel, but right-
+// anchored and rebuilt from live VideoState every displayed frame (see
+// update_stats()) instead of a static string table - both can be on screen
+// together, so it gets its own geometry buffers too.
+bool g_stats_active = false;
+int g_stats_char_count = 0;
+int g_stats_box_w = 0, g_stats_box_h = 0;
+const int kMaxStatsChars = 900;
+std::vector<std::string> g_stats_lines; // rebuilt each frame by update_stats()
+double g_smoothed_frame_ms = 0.0; // EMA, updated unconditionally in report_frame_time() - independent of the FSRCNN/RAVU-only fallback window below, since that one resets for every other upscaler mode
+
 float g_sharpness = 0.2f; // AMD's "stops" convention: 0.0 = max sharpness
 float g_nis_sharpness = 0.5f; // NIS's own [0,1] convention: 0.5 is its documented neutral default
 
@@ -627,6 +746,28 @@ enum class UpscalerMode { Bilinear, FSR1, NIS, FSRCNN, RAVU };
 const int kUpscalerModeCount = 5;
 const char *kUpscalerNames[] = { "Bilinear (off)", "FSR1 (EASU+RCAS)", "NIS", "FSRCNN", "RAVU-Lite" };
 UpscalerMode g_upscaler_mode = UpscalerMode::FSR1;
+
+// Adaptive fallback for the two neural upscalers (FSRCNN's 44 GL passes,
+// RAVU's own per-pixel filter): both are cheap enough on a discrete GPU but
+// can visibly stall an integrated one, and there's no reliable way to know
+// that ahead of time from GPU vendor/name strings - so instead this tracks
+// a rolling window of actual full-frame times (see report_frame_time(),
+// fed from Video::video_display()) and drops to FSR1 if the average can't
+// stay under budget. FSR1/NIS are deliberately excluded: they're 1-2 pass
+// shaders that are essentially never the actual bottleneck (decode/CPU
+// usually is), so auto-disabling them too would misfire and confuse a user
+// whose slowdown has nothing to do with the upscaler.
+const int kFrameTimeWindow = 20;
+const double kSlowFrameBudgetMs = 100.0; // ~10fps sustained - well below any real "smooth" threshold
+double g_frame_times_ms[kFrameTimeWindow] = {0};
+int g_frame_time_count = 0;
+int g_frame_time_next = 0;
+
+void reset_frame_time_window()
+{
+    g_frame_time_count = 0;
+    g_frame_time_next = 0;
+}
 
 // AMD's published FSR1 quality presets: the per-dimension ratio between the
 // image EASU actually upscales from and the final display size. "Native"
@@ -702,14 +843,15 @@ NISTuning compute_nis_tuning(float sharpness)
 bool VideoRenderer::init()
 {
     g_program_decode_yuv = Shader::compile_program(vertex_src, fragment_src_decode_yuv);
+    g_program_decode_yuv_hdr = Shader::compile_program(vertex_src, fragment_src_decode_yuv_hdr);
     g_program_decode_rgba = Shader::compile_program(vertex_src, fragment_src_decode_rgba);
     g_program_easu = Shader::compile_program(vertex_src, fragment_src_easu);
     g_program_rcas = Shader::compile_program(vertex_src, fragment_src_rcas);
     g_program_nis = Shader::compile_program(vertex_src, fragment_src_nis);
     g_program_text = Shader::compile_program(vertex_src, fragment_src_text);
     g_program_flat = Shader::compile_program(vertex_src, fragment_src_flat);
-    if (!g_program_decode_yuv || !g_program_decode_rgba || !g_program_easu || !g_program_rcas || !g_program_nis
-        || !g_program_text || !g_program_flat)
+    if (!g_program_decode_yuv || !g_program_decode_yuv_hdr || !g_program_decode_rgba || !g_program_easu
+        || !g_program_rcas || !g_program_nis || !g_program_text || !g_program_flat)
         return false;
 
     g_loc_decode_yuv_tex_y = gl::GetUniformLocation(g_program_decode_yuv, "uTexY");
@@ -717,6 +859,13 @@ bool VideoRenderer::init()
     g_loc_decode_yuv_tex_v = gl::GetUniformLocation(g_program_decode_yuv, "uTexV");
     g_loc_decode_yuv_mode = gl::GetUniformLocation(g_program_decode_yuv, "uYuvMode");
     g_loc_decode_yuv_flip = gl::GetUniformLocation(g_program_decode_yuv, "uFlipV");
+    g_loc_decode_yuv_bitscale = gl::GetUniformLocation(g_program_decode_yuv, "uBitScale");
+    g_loc_decode_hdr_tex_y = gl::GetUniformLocation(g_program_decode_yuv_hdr, "uTexY");
+    g_loc_decode_hdr_tex_u = gl::GetUniformLocation(g_program_decode_yuv_hdr, "uTexU");
+    g_loc_decode_hdr_tex_v = gl::GetUniformLocation(g_program_decode_yuv_hdr, "uTexV");
+    g_loc_decode_hdr_mode = gl::GetUniformLocation(g_program_decode_yuv_hdr, "uHdrMode");
+    g_loc_decode_hdr_flip = gl::GetUniformLocation(g_program_decode_yuv_hdr, "uFlipV");
+    g_loc_decode_hdr_bitscale = gl::GetUniformLocation(g_program_decode_yuv_hdr, "uBitScale");
     g_loc_decode_rgba_tex = gl::GetUniformLocation(g_program_decode_rgba, "uTex");
     g_loc_decode_rgba_flip = gl::GetUniformLocation(g_program_decode_rgba, "uFlipV");
     g_loc_easu_tex = gl::GetUniformLocation(g_program_easu, "uTex");
@@ -832,6 +981,30 @@ bool VideoRenderer::init()
     gl::EnableVertexAttribArray(1);
     gl::BindVertexArray(0);
 
+    // Stats panel's own box + glyph buffers, same layout as the help
+    // panel's - see update_stats()/build_stats_geometry().
+    gl::GenVertexArrays(1, &g_vao_stats_box);
+    gl::GenBuffers(1, &g_vbo_stats_box);
+    gl::BindVertexArray(g_vao_stats_box);
+    gl::BindBuffer(GL_ARRAY_BUFFER, g_vbo_stats_box);
+    gl::BufferData(GL_ARRAY_BUFFER, sizeof(float) * 16, NULL, GL_DYNAMIC_DRAW);
+    gl::VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
+    gl::EnableVertexAttribArray(0);
+    gl::VertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+    gl::EnableVertexAttribArray(1);
+    gl::BindVertexArray(0);
+
+    gl::GenVertexArrays(1, &g_vao_stats_text);
+    gl::GenBuffers(1, &g_vbo_stats_text);
+    gl::BindVertexArray(g_vao_stats_text);
+    gl::BindBuffer(GL_ARRAY_BUFFER, g_vbo_stats_text);
+    gl::BufferData(GL_ARRAY_BUFFER, sizeof(float) * 4 * 6 * kMaxStatsChars, NULL, GL_DYNAMIC_DRAW);
+    gl::VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
+    gl::EnableVertexAttribArray(0);
+    gl::VertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+    gl::EnableVertexAttribArray(1);
+    gl::BindVertexArray(0);
+
     gl::GenFramebuffers(1, &g_fbo_decode);
     gl::GenFramebuffers(1, &g_fbo_upscale);
     gl::GenFramebuffers(1, &g_fbo_downscale);
@@ -925,7 +1098,12 @@ void VideoRenderer::destroy()
     if (g_vao_help_text) gl::DeleteVertexArrays(1, &g_vao_help_text);
     if (g_vbo_help_box) gl::DeleteBuffers(1, &g_vbo_help_box);
     if (g_vao_help_box) gl::DeleteVertexArrays(1, &g_vao_help_box);
+    if (g_vbo_stats_text) gl::DeleteBuffers(1, &g_vbo_stats_text);
+    if (g_vao_stats_text) gl::DeleteVertexArrays(1, &g_vao_stats_text);
+    if (g_vbo_stats_box) gl::DeleteBuffers(1, &g_vbo_stats_box);
+    if (g_vao_stats_box) gl::DeleteVertexArrays(1, &g_vao_stats_box);
     if (g_program_decode_yuv) gl::DeleteProgram(g_program_decode_yuv);
+    if (g_program_decode_yuv_hdr) gl::DeleteProgram(g_program_decode_yuv_hdr);
     if (g_program_decode_rgba) gl::DeleteProgram(g_program_decode_rgba);
     if (g_program_easu) gl::DeleteProgram(g_program_easu);
     if (g_program_rcas) gl::DeleteProgram(g_program_rcas);
@@ -940,36 +1118,49 @@ void VideoRenderer::destroy()
     g_vbo_static = g_vao_static = g_vbo_composite = g_vao_composite = 0;
     g_vbo_text = g_vao_text = g_vbo_box = g_vao_box = 0;
     g_vbo_help_text = g_vao_help_text = g_vbo_help_box = g_vao_help_box = 0;
-    g_program_decode_yuv = g_program_decode_rgba = g_program_easu = g_program_rcas = g_program_nis = 0;
+    g_vbo_stats_text = g_vao_stats_text = g_vbo_stats_box = g_vao_stats_box = 0;
+    g_program_decode_yuv = g_program_decode_yuv_hdr = g_program_decode_rgba = g_program_easu = g_program_rcas = g_program_nis = 0;
     g_program_text = g_program_flat = 0;
     g_y_w = g_y_h = g_uv_w = g_uv_h = g_rgba_w = g_rgba_h = 0;
     g_decode_w = g_decode_h = g_upscale_w = g_upscale_h = g_downscale_w = g_downscale_h = 0;
+    g_yuv_10bit = g_yuv_hdr = false;
+    g_yuv_bit_scale = 1.0f;
+    g_yuv_hdr_trc = 1;
+    reset_frame_time_window();
     g_help_active = false;
+    g_stats_active = false;
     g_overlay_active = false;
 }
 
-bool VideoRenderer::ensure_yuv_textures(int width, int height)
+bool VideoRenderer::ensure_yuv_textures(int width, int height, bool bit10)
 {
     int uv_w = AV_CEIL_RSHIFT(width, 1);
     int uv_h = AV_CEIL_RSHIFT(height, 1);
-    if (g_tex_y && g_y_w == width && g_y_h == height && g_uv_w == uv_w && g_uv_h == uv_h)
+    if (g_tex_y && g_y_w == width && g_y_h == height && g_uv_w == uv_w && g_uv_h == uv_h && g_yuv_10bit == bit10)
         return true;
 
     if (!g_tex_y) g_tex_y = make_clamped_linear_texture();
     if (!g_tex_u) g_tex_u = make_clamped_linear_texture();
     if (!g_tex_v) g_tex_v = make_clamped_linear_texture();
 
+    // 10-bit planes (GL_R16, core since GL 3.0) hold ffmpeg's raw 16-bit
+    // words - the true sample is in the low 10 bits, not left-shifted - see
+    // fragment_src_decode_yuv's uBitScale comment for how that's corrected.
+    GLenum internalFmt = bit10 ? GL_R16 : GL_R8;
+    GLenum type = bit10 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE;
+
     glBindTexture(GL_TEXTURE_2D, g_tex_y);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, internalFmt, width, height, 0, GL_RED, type, NULL);
     glBindTexture(GL_TEXTURE_2D, g_tex_u);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_w, uv_h, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, internalFmt, uv_w, uv_h, 0, GL_RED, type, NULL);
     glBindTexture(GL_TEXTURE_2D, g_tex_v);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_w, uv_h, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, internalFmt, uv_w, uv_h, 0, GL_RED, type, NULL);
 
     g_y_w = width;
     g_y_h = height;
     g_uv_w = uv_w;
     g_uv_h = uv_h;
+    g_yuv_10bit = bit10;
     return true;
 }
 
@@ -1036,8 +1227,10 @@ bool VideoRenderer::ensure_downscale_target(int width, int height)
 
 bool VideoRenderer::upload_frame(AVFrame *frame, struct SwsContext **img_convert_ctx)
 {
-    if (frame->format == AV_PIX_FMT_YUV420P) {
-        if (!ensure_yuv_textures(frame->width, frame->height))
+    bool is_8bit = frame->format == AV_PIX_FMT_YUV420P;
+    bool is_10bit = frame->format == AV_PIX_FMT_YUV420P10LE;
+    if (is_8bit || is_10bit) {
+        if (!ensure_yuv_textures(frame->width, frame->height, is_10bit))
             return false;
 
         uint8_t *y_data = frame->data[0];
@@ -1049,7 +1242,9 @@ bool VideoRenderer::upload_frame(AVFrame *frame, struct SwsContext **img_convert
 
         // Bottom-up frames (negative linesize) are re-pointed to their last
         // row with a positive stride, so uploads always walk top-to-bottom -
-        // same normalization ffplay's upload_texture() did for SDL.
+        // same normalization ffplay's upload_texture() did for SDL. This is
+        // plain byte-addressed pointer arithmetic, so it's correct
+        // regardless of whether each sample is 1 or 2 bytes.
         if (y_stride < 0 && u_stride < 0 && v_stride < 0) {
             y_data += y_stride * (frame->height - 1);
             u_data += u_stride * (g_uv_h - 1);
@@ -1062,10 +1257,14 @@ bool VideoRenderer::upload_frame(AVFrame *frame, struct SwsContext **img_convert
             return false;
         }
 
-        auto upload_plane = [](GLuint tex, uint8_t *data, int stride, int w, int h) {
+        // GL_UNPACK_ROW_LENGTH counts texels, not bytes - divide the
+        // (byte) linesize down for 10-bit's 2-bytes-per-sample planes.
+        GLenum type = is_10bit ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE;
+        int bytes_per_texel = is_10bit ? 2 : 1;
+        auto upload_plane = [type, bytes_per_texel](GLuint tex, uint8_t *data, int stride, int w, int h) {
             glBindTexture(GL_TEXTURE_2D, tex);
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, stride);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RED, GL_UNSIGNED_BYTE, data);
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / bytes_per_texel);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RED, type, data);
             glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
         };
 
@@ -1078,6 +1277,10 @@ bool VideoRenderer::upload_frame(AVFrame *frame, struct SwsContext **img_convert
             g_yuv_mode = 1;
         else if (frame->colorspace == AVCOL_SPC_BT709)
             g_yuv_mode = 2;
+
+        g_yuv_hdr = frame->color_trc == AVCOL_TRC_SMPTE2084 || frame->color_trc == AVCOL_TRC_ARIB_STD_B67;
+        g_yuv_hdr_trc = frame->color_trc == AVCOL_TRC_ARIB_STD_B67 ? 2 : 1;
+        g_yuv_bit_scale = is_10bit ? (65535.0f / 1023.0f) : 1.0f;
 
         g_using_yuv = true;
         return true;
@@ -1146,18 +1349,28 @@ void VideoRenderer::draw(const SDL_Rect &rect, int drawable_w, int drawable_h, b
     glViewport(0, 0, src_w, src_h);
     gl::BindVertexArray(g_vao_static);
     if (g_using_yuv) {
-        gl::UseProgram(g_program_decode_yuv);
+        gl::UseProgram(g_yuv_hdr ? g_program_decode_yuv_hdr : g_program_decode_yuv);
         gl::ActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_tex_y);
         gl::ActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, g_tex_u);
         gl::ActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, g_tex_v);
-        gl::Uniform1i(g_loc_decode_yuv_tex_y, 0);
-        gl::Uniform1i(g_loc_decode_yuv_tex_u, 1);
-        gl::Uniform1i(g_loc_decode_yuv_tex_v, 2);
-        gl::Uniform1i(g_loc_decode_yuv_mode, g_yuv_mode);
-        gl::Uniform1i(g_loc_decode_yuv_flip, flip_v ? 1 : 0);
+        if (g_yuv_hdr) {
+            gl::Uniform1i(g_loc_decode_hdr_tex_y, 0);
+            gl::Uniform1i(g_loc_decode_hdr_tex_u, 1);
+            gl::Uniform1i(g_loc_decode_hdr_tex_v, 2);
+            gl::Uniform1i(g_loc_decode_hdr_mode, g_yuv_hdr_trc);
+            gl::Uniform1i(g_loc_decode_hdr_flip, flip_v ? 1 : 0);
+            gl::Uniform1f(g_loc_decode_hdr_bitscale, g_yuv_bit_scale);
+        } else {
+            gl::Uniform1i(g_loc_decode_yuv_tex_y, 0);
+            gl::Uniform1i(g_loc_decode_yuv_tex_u, 1);
+            gl::Uniform1i(g_loc_decode_yuv_tex_v, 2);
+            gl::Uniform1i(g_loc_decode_yuv_mode, g_yuv_mode);
+            gl::Uniform1i(g_loc_decode_yuv_flip, flip_v ? 1 : 0);
+            gl::Uniform1f(g_loc_decode_yuv_bitscale, g_yuv_bit_scale);
+        }
     } else {
         gl::UseProgram(g_program_decode_rgba);
         gl::ActiveTexture(GL_TEXTURE0);
@@ -1280,6 +1493,7 @@ void VideoRenderer::draw(const SDL_Rect &rect, int drawable_w, int drawable_h, b
 
     draw_overlay(drawable_w, drawable_h);
     draw_help(drawable_w, drawable_h);
+    draw_stats(drawable_w, drawable_h);
 
     GLenum err;
     while ((err = glGetError()) != GL_NO_ERROR)
@@ -1562,14 +1776,268 @@ void VideoRenderer::draw_help(int drawable_w, int drawable_h)
     glDisable(GL_BLEND);
 }
 
+void VideoRenderer::build_stats_geometry()
+{
+    int drawable_w = 0, drawable_h = 0;
+    SDL_GL_GetDrawableSize(window, &drawable_w, &drawable_h);
+    if (drawable_w <= 0 || drawable_h <= 0)
+        return;
+
+    int lineCount = (int)g_stats_lines.size();
+    int maxLineLen = 0;
+    for (const auto &line : g_stats_lines)
+        if ((int)line.size() > maxLineLen)
+            maxLineLen = (int)line.size();
+
+    g_stats_box_w = kOverlayPaddingPx * 2 + maxLineLen * kGlyphCell;
+    g_stats_box_h = kOverlayPaddingPx * 2 + lineCount * kGlyphCell;
+
+    // Right-anchored: the box's right edge sits kOverlayMarginPx in from
+    // the drawable's right edge, mirroring the help panel's left-anchored
+    // kOverlayMarginPx from the left edge. Needs the box width up front
+    // (unlike the help panel, which only needs it after the fact for
+    // drawing the background) since it's also this pass's per-glyph X
+    // origin - hence computing g_stats_box_w/h before the glyph loop here.
+    int boxX0 = drawable_w - kOverlayMarginPx - g_stats_box_w;
+    int textX0 = boxX0 + kOverlayPaddingPx;
+    int textY0 = kOverlayMarginPx + kOverlayPaddingPx;
+
+    std::vector<float> verts;
+    int totalChars = 0;
+
+    for (int line = 0; line < lineCount; line++) {
+        const std::string &text = g_stats_lines[line];
+        int len = (int)text.size();
+        for (int i = 0; i < len && totalChars < kMaxStatsChars; i++) {
+            unsigned char c = (unsigned char)text[i];
+            int glyph = (c < 128) ? c : 32;
+            int col = glyph % kFontCols;
+            int row = glyph / kFontCols;
+            float u0 = (float)col / kFontCols;
+            float v0 = (float)row / kFontRows;
+            float u1 = (float)(col + 1) / kFontCols;
+            float v1 = (float)(row + 1) / kFontRows;
+
+            float px0 = (float)(textX0 + i * kGlyphCell);
+            float py0 = (float)(textY0 + line * kGlyphCell);
+            float px1 = px0 + kGlyphCell;
+            float py1 = py0 + kGlyphCell;
+
+            float x0 = (px0 / drawable_w) * 2.0f - 1.0f;
+            float x1 = (px1 / drawable_w) * 2.0f - 1.0f;
+            float y0 = 1.0f - (py0 / drawable_h) * 2.0f;
+            float y1 = 1.0f - (py1 / drawable_h) * 2.0f;
+
+            float quad[24] = {
+                x0, y0, u0, v0,
+                x1, y0, u1, v0,
+                x0, y1, u0, v1,
+
+                x1, y0, u1, v0,
+                x1, y1, u1, v1,
+                x0, y1, u0, v1,
+            };
+            verts.insert(verts.end(), quad, quad + 24);
+            totalChars++;
+        }
+    }
+
+    if (!verts.empty()) {
+        gl::BindBuffer(GL_ARRAY_BUFFER, g_vbo_stats_text);
+        gl::BufferSubData(GL_ARRAY_BUFFER, 0, verts.size() * sizeof(float), verts.data());
+    }
+
+    g_stats_char_count = totalChars;
+}
+
+void VideoRenderer::toggle_stats()
+{
+    g_stats_active = !g_stats_active;
+}
+
+bool VideoRenderer::stats_visible()
+{
+    return g_stats_active;
+}
+
+void VideoRenderer::draw_stats(int drawable_w, int drawable_h)
+{
+    if (!g_stats_active)
+        return;
+
+    build_stats_geometry();
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    {
+        float bx1 = (float)(drawable_w - kOverlayMarginPx);
+        float bx0 = bx1 - g_stats_box_w;
+        float by0 = (float)kOverlayMarginPx;
+        float by1 = by0 + g_stats_box_h;
+
+        float x0 = (bx0 / drawable_w) * 2.0f - 1.0f;
+        float x1 = (bx1 / drawable_w) * 2.0f - 1.0f;
+        float y0 = 1.0f - (by0 / drawable_h) * 2.0f;
+        float y1 = 1.0f - (by1 / drawable_h) * 2.0f;
+
+        float verts[16] = {
+            x0, y0, 0.0f, 0.0f,
+            x1, y0, 1.0f, 0.0f,
+            x0, y1, 0.0f, 1.0f,
+            x1, y1, 1.0f, 1.0f,
+        };
+        gl::BindBuffer(GL_ARRAY_BUFFER, g_vbo_stats_box);
+        gl::BufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+
+        gl::UseProgram(g_program_flat);
+        gl::Uniform4f(g_loc_flat_color, 0.0f, 0.0f, 0.0f, 0.75f); // matches the help panel's box opacity
+        gl::BindVertexArray(g_vao_stats_box);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+
+    if (g_stats_char_count > 0) {
+        gl::UseProgram(g_program_text);
+        gl::ActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_tex_font_atlas);
+        gl::Uniform1i(g_loc_text_atlas, 0);
+        gl::Uniform3f(g_loc_text_color, 1.0f, 1.0f, 1.0f);
+        gl::Uniform1f(g_loc_text_alpha, 1.0f);
+        gl::BindVertexArray(g_vao_stats_text);
+        glDrawArrays(GL_TRIANGLES, 0, g_stats_char_count * 6);
+    }
+
+    gl::BindVertexArray(0);
+    glDisable(GL_BLEND);
+}
+
+void VideoRenderer::update_stats(VideoState *videostate)
+{
+    if (!g_stats_active)
+        return;
+
+    g_stats_lines.clear();
+    char buf[160];
+
+    g_stats_lines.push_back("DECODE STATS   (I to close)");
+    g_stats_lines.push_back("");
+
+    g_stats_lines.push_back("-- Video --");
+    AVCodecContext *vctx = videostate->viddec.avctx;
+    if (vctx) {
+        snprintf(buf, sizeof buf, "Codec: %s", avcodec_get_name(vctx->codec_id));
+        g_stats_lines.push_back(buf);
+        snprintf(buf, sizeof buf, "Resolution: %dx%d", vctx->width, vctx->height);
+        g_stats_lines.push_back(buf);
+        const char *pixfmt = av_get_pix_fmt_name(vctx->pix_fmt);
+        snprintf(buf, sizeof buf, "Pixel format: %s (%s)", pixfmt ? pixfmt : "?", g_yuv_10bit ? "10-bit" : "8-bit");
+        g_stats_lines.push_back(buf);
+        const char *range = av_color_range_name(vctx->color_range);
+        const char *prim = av_color_primaries_name(vctx->color_primaries);
+        const char *trc = av_color_transfer_name(vctx->color_trc);
+        snprintf(buf, sizeof buf, "Color: %s / %s / %s", range ? range : "?", prim ? prim : "?", trc ? trc : "?");
+        g_stats_lines.push_back(buf);
+        snprintf(buf, sizeof buf, "HDR: %s",
+                 !g_yuv_hdr ? "off" : (g_yuv_hdr_trc == 2 ? "HLG -> SDR tonemap" : "PQ -> SDR tonemap"));
+        g_stats_lines.push_back(buf);
+    } else {
+        g_stats_lines.push_back("(no video stream)");
+    }
+    g_stats_lines.push_back("");
+
+    g_stats_lines.push_back("-- Playback --");
+    double fps = g_smoothed_frame_ms > 0.0 ? (1000.0 / g_smoothed_frame_ms) : 0.0;
+    snprintf(buf, sizeof buf, "Frame time: %.1fms (~%.1f fps)", g_smoothed_frame_ms, fps);
+    g_stats_lines.push_back(buf);
+    snprintf(buf, sizeof buf, "Upscaler: %s", upscaler_name());
+    g_stats_lines.push_back(buf);
+    snprintf(buf, sizeof buf, "Scale preset: %s", render_scale_name());
+    g_stats_lines.push_back(buf);
+    snprintf(buf, sizeof buf, "State: %s%s", videostate->paused ? "Paused" : "Playing",
+             videostate->muted ? "  (muted)" : "");
+    g_stats_lines.push_back(buf);
+    g_stats_lines.push_back("");
+
+    g_stats_lines.push_back("-- Queues / drops --");
+    snprintf(buf, sizeof buf, "Video queue: %d pkts, %d frames", videostate->videoq.nb_packets,
+             frame_queue_nb_remaining(&videostate->pictq));
+    g_stats_lines.push_back(buf);
+    snprintf(buf, sizeof buf, "Audio queue: %d pkts, %d frames", videostate->audioq.nb_packets,
+             frame_queue_nb_remaining(&videostate->sampq));
+    g_stats_lines.push_back(buf);
+    snprintf(buf, sizeof buf, "Subtitle queue: %d pkts", videostate->subtitleq.nb_packets);
+    g_stats_lines.push_back(buf);
+    snprintf(buf, sizeof buf, "Dropped frames: early=%d late=%d", videostate->frame_drops_early,
+             videostate->frame_drops_late);
+    g_stats_lines.push_back(buf);
+    g_stats_lines.push_back("");
+
+    g_stats_lines.push_back("-- Audio --");
+    AVCodecContext *actx = videostate->auddec.avctx;
+    if (actx) {
+        snprintf(buf, sizeof buf, "Codec: %s  %dHz  %dch", avcodec_get_name(actx->codec_id), actx->sample_rate,
+                 actx->ch_layout.nb_channels);
+        g_stats_lines.push_back(buf);
+    } else {
+        g_stats_lines.push_back("(no audio stream)");
+    }
+    g_stats_lines.push_back("");
+
+    g_stats_lines.push_back("-- Window --");
+    int drawable_w = 0, drawable_h = 0;
+    SDL_GL_GetDrawableSize(window, &drawable_w, &drawable_h);
+    snprintf(buf, sizeof buf, "Drawable: %dx%d", drawable_w, drawable_h);
+    g_stats_lines.push_back(buf);
+    if (vctx)
+        snprintf(buf, sizeof buf, "Video native: %dx%d", vctx->width, vctx->height);
+    else
+        snprintf(buf, sizeof buf, "Video native: ?");
+    g_stats_lines.push_back(buf);
+}
+
 void VideoRenderer::cycle_upscaler()
 {
     g_upscaler_mode = static_cast<UpscalerMode>((static_cast<int>(g_upscaler_mode) + 1) % kUpscalerModeCount);
+    reset_frame_time_window(); // fresh evaluation window for whatever mode was just picked
 }
 
 const char *VideoRenderer::upscaler_name()
 {
     return kUpscalerNames[static_cast<int>(g_upscaler_mode)];
+}
+
+void VideoRenderer::report_frame_time(double ms)
+{
+    // Unconditional (unlike the FSRCNN/RAVU-only governor below), so the
+    // stats panel always has a real measured fps regardless of upscaler.
+    const double kEmaAlpha = 0.1;
+    g_smoothed_frame_ms = (g_smoothed_frame_ms <= 0.0) ? ms : (g_smoothed_frame_ms * (1.0 - kEmaAlpha) + ms * kEmaAlpha);
+
+    if (g_upscaler_mode != UpscalerMode::FSRCNN && g_upscaler_mode != UpscalerMode::RAVU) {
+        reset_frame_time_window();
+        return;
+    }
+
+    g_frame_times_ms[g_frame_time_next] = ms;
+    g_frame_time_next = (g_frame_time_next + 1) % kFrameTimeWindow;
+    if (g_frame_time_count < kFrameTimeWindow)
+        g_frame_time_count++;
+    if (g_frame_time_count < kFrameTimeWindow)
+        return; // not enough samples in this mode yet to judge it fairly
+
+    double sum = 0.0;
+    for (int i = 0; i < kFrameTimeWindow; i++)
+        sum += g_frame_times_ms[i];
+    double avg = sum / kFrameTimeWindow;
+
+    if (avg > kSlowFrameBudgetMs) {
+        const char *slow_name = upscaler_name();
+        g_upscaler_mode = UpscalerMode::FSR1;
+        reset_frame_time_window();
+        Log::info() << "Auto-switched upscaler: " << slow_name << " averaged " << avg
+                    << "ms/frame on this GPU, falling back to FSR1.";
+        show_overlay(std::string("Auto-switched to FSR1 (") + slow_name + " too slow)");
+    }
 }
 
 void VideoRenderer::cycle_render_scale()

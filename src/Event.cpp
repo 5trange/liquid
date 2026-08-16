@@ -130,6 +130,11 @@ void Event::event_loop(VideoState *videostate)
                 // SDLK_u/SDLK_r.
                 VideoRenderer::toggle_help();
                 break;
+            case SDLK_i:
+                // Same reasoning as SDLK_h - the panel's own appearance is
+                // the feedback, no force_refresh/toast needed.
+                VideoRenderer::toggle_stats();
+                break;
             case SDLK_PAGEUP:
                 if (videostate->ic->nb_chapters <= 1) {
                     incr = 600.0;

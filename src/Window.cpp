@@ -45,6 +45,31 @@ void Window::set_default_window_size(int width, int height, AVRational sar)
     SDL_Rect rect;
     int max_width  = screen_width  ? screen_width  : INT_MAX;
     int max_height = screen_height ? screen_height : INT_MAX;
+
+    // screen_width/screen_height only get populated reactively, from an
+    // SDL_WINDOWEVENT_SIZE_CHANGED the user's own resize fires (see
+    // Event.cpp) - never proactively from the actual display. Without also
+    // clamping to the display's real usable bounds here, a video larger
+    // than the screen produces a window sized to the video's native
+    // resolution, sticking out past the screen edges (masked while the app
+    // is fullscreen, but exposed the moment it drops back to windowed
+    // mode). window is always valid by this point - create_window() runs
+    // before the stream-open thread that calls this. Leave a small margin
+    // off the usable bounds for window chrome (title bar/decorations),
+    // since "usable" already excludes taskbars/docks. If the query isn't
+    // available for some reason, fall back to the prior (unclamped) behavior.
+    if (window) {
+        SDL_Rect display_bounds;
+        int display_index = SDL_GetWindowDisplayIndex(window);
+        if (display_index >= 0 && SDL_GetDisplayUsableBounds(display_index, &display_bounds) == 0) {
+            const int margin = 40;
+            int usable_w = FFMAX(display_bounds.w - margin, 1);
+            int usable_h = FFMAX(display_bounds.h - margin, 1);
+            if (max_width > usable_w) max_width = usable_w;
+            if (max_height > usable_h) max_height = usable_h;
+        }
+    }
+
     if (max_width == INT_MAX && max_height == INT_MAX)
         max_height = height;
     calculate_display_rect(&rect, 0, 0, max_width, max_height, width, height, sar);

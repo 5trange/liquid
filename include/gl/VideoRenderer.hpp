@@ -26,8 +26,10 @@ class VideoRenderer
         static bool init();
         static void destroy();
 
-        // Uploads a decoded frame to GL textures, converting on the CPU via
-        // sws_scale first for any pixel format that isn't planar YUV420P.
+        // Uploads a decoded frame to GL textures. Planar 8-bit (YUV420P) and
+        // 10-bit (YUV420P10LE) YUV go straight to GL with no CPU-side pixel
+        // conversion; anything else falls back to a CPU sws_scale -> BGRA
+        // conversion first (much slower - see upload_frame's definition).
         static bool upload_frame(AVFrame *frame, struct SwsContext **img_convert_ctx);
 
         // Runs the decode -> upscale -> composite pipeline for the most
@@ -49,6 +51,14 @@ class VideoRenderer
         // (EASU+RCAS) -> NIS -> back to Bilinear. Use for A/B comparison.
         static void cycle_upscaler();
         static const char *upscaler_name();
+
+        // Feeds the wall-clock time (ms) of the most recently displayed
+        // frame into the adaptive-fallback governor. Only matters while
+        // FSRCNN/RAVU are active - see the kFrameTimeWindow/
+        // kSlowFrameBudgetMs comment in VideoRenderer.cpp - and silently
+        // resets its tracking window for every other mode. Call once per
+        // displayed frame (see Video::video_display()).
+        static void report_frame_time(double ms);
 
         // Cycles through AMD's published FSR1 quality presets (Native,
         // Ultra Quality 1.3x, Quality 1.5x, Balanced 1.7x, Performance 2.0x).
@@ -75,8 +85,22 @@ class VideoRenderer
         static void toggle_help();
         static bool help_visible();
 
+        // Toggles a persistent decode/playback stats panel, right edge of
+        // the screen, off by default - codec/pixel-format/color info,
+        // measured fps, upscaler mode, queue depths, drop counts. Unlike
+        // the help panel's static text, this is rebuilt from live state via
+        // update_stats() every displayed frame (cheap no-op while hidden).
+        static void toggle_stats();
+        static bool stats_visible();
+
+        // Refreshes the stats panel's text from current playback state.
+        // No-op while the panel is hidden. Call once per displayed frame,
+        // wherever the caller already has `videostate` in scope (see
+        // Video::video_image_display()).
+        static void update_stats(VideoState *videostate);
+
     private:
-        static bool ensure_yuv_textures(int width, int height);
+        static bool ensure_yuv_textures(int width, int height, bool bit10);
         static bool ensure_rgba_texture(int width, int height);
         static bool ensure_decode_target(int width, int height);
         static bool ensure_upscale_target(int width, int height);
@@ -86,4 +110,6 @@ class VideoRenderer
         static void draw_overlay(int drawable_w, int drawable_h);
         static void build_help_geometry();
         static void draw_help(int drawable_w, int drawable_h);
+        static void build_stats_geometry();
+        static void draw_stats(int drawable_w, int drawable_h);
 };

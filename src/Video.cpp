@@ -203,9 +203,21 @@ void Video::video_display(VideoState *videostate)
     if (!videostate->window_opened)
         video_open(videostate);
     VideoRenderer::clear();
-    if (videostate->video_st)
+
+    // Timed end-to-end (decode upload + upscale + composite + the
+    // vsync-blocking swap) so the adaptive upscaler fallback sees the same
+    // per-frame cost the user actually experiences as lag - see
+    // VideoRenderer::report_frame_time().
+    bool has_video = videostate->video_st != NULL;
+    Uint64 t0 = has_video ? SDL_GetPerformanceCounter() : 0;
+    if (has_video)
         video_image_display(videostate);
     present();
+    if (has_video) {
+        Uint64 t1 = SDL_GetPerformanceCounter();
+        double ms = (double)(t1 - t0) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+        VideoRenderer::report_frame_time(ms);
+    }
 }
 
 void Video::present()
@@ -264,5 +276,6 @@ void Video::video_image_display(VideoState *videostate)
         vp->flip_v = vp->frame->linesize[0] < 0;
     }
 
+    VideoRenderer::update_stats(videostate); // no-op while the panel's toggled off
     VideoRenderer::draw(rect, out_w, out_h, vp->flip_v != 0);
 }
