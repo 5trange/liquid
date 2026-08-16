@@ -5,6 +5,7 @@
 #include "Window.hpp"
 #include "Video.hpp"
 #include "SeekPause.hpp"
+#include "utils/Log.hpp"
 
 int Thread::read_thread(void *arg)
 {
@@ -21,7 +22,7 @@ int Thread::read_thread(void *arg)
     int64_t pkt_ts;
 
     if (!wait_mutex) {
-        std::cout<<"FATAL ERROR: SDL_CreateMutex() failed!"<<SDL_GetError()<<std::endl;
+        Log::error() << "SDL_CreateMutex() failed: " << SDL_GetError();
         ret = AVERROR(ENOMEM);
         goto fail;
     }
@@ -31,13 +32,13 @@ int Thread::read_thread(void *arg)
 
     pkt = av_packet_alloc();
     if (!pkt) {
-        std::cout<<"FATAL ERROR: Could not allocate packet!"<<std::endl;
+        Log::error() << "Could not allocate packet!";
         ret = AVERROR(ENOMEM);
         goto fail;
     }
     ic = avformat_alloc_context();
     if (!ic) {
-        std::cout<<"FATAL ERROR: Could not allocate context!"<<std::endl;
+        Log::error() << "Could not allocate context!";
         ret = AVERROR(ENOMEM);
         goto fail;
     }
@@ -61,7 +62,7 @@ int Thread::read_thread(void *arg)
         err = avformat_find_stream_info(ic, NULL);
 
         if (err < 0) {
-            std::cout<<"FATAL ERROR: Could not find codec parameters: "<<videostate->filename<<std::endl;
+            Log::error() << "Could not find codec parameters: " << videostate->filename;
             ret = -1;
             goto fail;
         }
@@ -88,7 +89,7 @@ int Thread::read_thread(void *arg)
             timestamp += ic->start_time;
         ret = avformat_seek_file(ic, -1, INT64_MIN, timestamp, INT64_MAX, 0);
         if (ret < 0) {
-            std::cout<<"ERROR: Could not seek to position!"<<std::endl;
+            Log::error() << "Could not seek to position!";
         }
     }
 
@@ -107,7 +108,7 @@ int Thread::read_thread(void *arg)
     }
     for (i = 0; i < AVMEDIA_TYPE_NB; i++) {
         if (wanted_stream_spec[i] && st_index[i] == -1) {
-            std::cout<<"ERROR: Stream specifier does not match any stream!"<<std::endl;
+            Log::error() << "Stream specifier does not match any stream!";
             st_index[i] = INT_MAX;
         }
     }
@@ -155,7 +156,7 @@ int Thread::read_thread(void *arg)
     }
 
     if (videostate->video_stream < 0 && videostate->audio_stream < 0) {
-        std::cout<<"FATAL ERROR: Failed to open file: "<<videostate->filename<<std::endl;
+        Log::error() << "Failed to open file: " << videostate->filename;
         ret = -1;
         goto fail;
     }
@@ -183,7 +184,7 @@ int Thread::read_thread(void *arg)
 
             ret = avformat_seek_file(videostate->ic, -1, seek_min, seek_target, seek_max, videostate->seek_flags);
             if (ret < 0){
-                std::cout<<"ERROR: Could not seek: "<<videostate->ic->url<<std::endl;
+                Log::error() << "Could not seek: " << videostate->ic->url;
             } 
             else{
                 if (videostate->audio_stream >= 0)

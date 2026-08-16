@@ -4,6 +4,7 @@
 #include "utils/Thread.hpp"
 #include "utils/Audio.hpp"
 #include "Decoder.hpp"
+#include "utils/Log.hpp"
 
 
 
@@ -43,7 +44,7 @@ VideoState *Stream::stream_open(char *filename)
         goto fail;
 
     if (!(videostate->continue_read_thread = SDL_CreateCond())) {
-        std::cout<<"FATAL ERROR: SDL_CreateCond() failed!"<<SDL_GetError()<<std::endl;
+        Log::error() << "SDL_CreateCond() failed: " << SDL_GetError();
         goto fail;
     }
 
@@ -52,9 +53,9 @@ VideoState *Stream::stream_open(char *filename)
     Clock::init_clock(&videostate->extclk, &videostate->extclk.serial);
     videostate->audio_clock_serial = -1;
     if (startup_volume < 0)
-        std::cout<<"Setting volume to 0."<<std::endl;
+        Log::warn() << "Requested volume is below 0, setting volume to 0.";
     if (startup_volume > 100)
-        std::cout<<"Setting volume to 100."<<std::endl;
+        Log::warn() << "Requested volume is above 100, setting volume to 100.";
     startup_volume = av_clip(startup_volume, 0, 100);
     startup_volume = av_clip(SDL_MIX_MAXVOLUME * startup_volume / 100, 0, SDL_MIX_MAXVOLUME);
     videostate->audio_volume = startup_volume;
@@ -62,7 +63,7 @@ VideoState *Stream::stream_open(char *filename)
     videostate->av_sync_type = av_sync_type;
     videostate->read_tid     = SDL_CreateThread(Thread::read_thread, "read_thread", videostate);
     if (!videostate->read_tid) {
-        std::cout<<"FATAL ERROR: SDL_CreateThread() failed!"<<SDL_GetError()<<std::endl;
+        Log::error() << "SDL_CreateThread() failed: " << SDL_GetError();
 fail:
         Stream::stream_close(videostate);
         return NULL;
@@ -98,10 +99,6 @@ void Stream::stream_close(VideoState *videostate)
     sws_freeContext(videostate->img_convert_ctx);
     sws_freeContext(videostate->sub_convert_ctx);
     av_free(videostate->filename);
-    if (videostate->vid_texture)
-        SDL_DestroyTexture(videostate->vid_texture);
-    if (videostate->sub_texture)
-        SDL_DestroyTexture(videostate->sub_texture);
     av_free(videostate);
 }
 
@@ -141,16 +138,16 @@ int Stream::stream_component_open(VideoState *videostate, int stream_index)
         codec = avcodec_find_decoder_by_name(forced_codec_name);
     if (!codec) {
         if (forced_codec_name)
-            std::cout<<"ERROR: No codec found: "<<forced_codec_name<<std::endl;
-        else                   
-            std::cout<<"ERROR: No decoder could be found for codec: "<<avcodec_get_name(avctx->codec_id)<<std::endl;
+            Log::error() << "No codec found: " << forced_codec_name;
+        else
+            Log::error() << "No decoder could be found for codec: " << avcodec_get_name(avctx->codec_id);
         ret = AVERROR(EINVAL);
         goto fail;
     }
 
     avctx->codec_id = codec->id;
     if (stream_lowres > codec->max_lowres) {
-        std::cout<<"ERROR: The maximum value for lowres supported by the decoder is "<<codec->max_lowres<<std::endl;
+        Log::warn() << "The maximum value for lowres supported by the decoder is " << codec->max_lowres;
         stream_lowres = codec->max_lowres;
     }
     avctx->lowres = stream_lowres;
@@ -166,7 +163,7 @@ int Stream::stream_component_open(VideoState *videostate, int stream_index)
         goto fail;
     }
     if ((t = av_dict_get(opts, "", NULL, AV_DICT_IGNORE_SUFFIX))) {
-        std::cout<<"ERROR: Option for found "<<t->key<<std::endl;
+        Log::error() << "Option not found: " << t->key;
         ret =  AVERROR_OPTION_NOT_FOUND;
         goto fail;
     }

@@ -8,17 +8,18 @@
 #include "Stream.hpp"
 #include "Window.hpp"
 #include "Event.hpp"
+#include "utils/Log.hpp"
 
 
 Liquid::Liquid(int argc, char *argv[])
 {
     if(argc < 2){
-        std::cout<<"ERROR: Please provide an input file."<<std::endl;
+        Log::error() << "Please provide an input file.";
         exit(-1);
     }
 
     if (!std::filesystem::exists(argv[1])){
-        std::cout<<"The input file is not valid!"<<std::endl;
+        Log::error() << "The input file is not valid!";
         exit(-1);
     }
     input_filename = argv[1];
@@ -31,8 +32,7 @@ void Liquid::run()
     SDL_setenv("SDL_AUDIO_ALSA_SET_BUFFER_SIZE","1", 1);
 
     if (SDL_Init (flags)) {
-        std::cout<<"ERROR: Could not initialize SDL!"<<std::endl;
-        std::cout<<SDL_GetError()<<std::endl;
+        Log::error() << "Could not initialize SDL! " << SDL_GetError();
         exit(-1);
     }
 
@@ -44,13 +44,13 @@ void Liquid::run()
     #endif
 
     if(Window::create_window() != 0){
-        std::cout<<"ERROR: Could not setup a window or renderer!"<<std::endl;
+        Log::error() << "Could not set up a window or OpenGL context!";
         exit(-1);
-    }  
+    }
 
     videostate = Stream::stream_open(input_filename);
     if(!videostate){
-        std::cout<<"ERROR: Failed to initialize VideoState!"<<std::endl;
+        Log::error() << "Failed to initialize VideoState!";
         exit(-1);
     }
 

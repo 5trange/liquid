@@ -18,8 +18,10 @@ add_executable(liquid ${SOURCES})
 # add dependencies
 include(cmake/FFMPEG.cmake)
 include(cmake/SDL2.cmake)
+include(cmake/OpenGL.cmake)
 
 target_link_libraries(liquid
     ffmpeg
     sdl2
+    opengl
 )

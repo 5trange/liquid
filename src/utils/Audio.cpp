@@ -1,6 +1,7 @@
 #include "utils/Audio.hpp"
 #include "utils/Clock.hpp"
 #include "Window.hpp"
+#include "utils/Log.hpp"
 
 int Audio::audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int wanted_sample_rate, struct AudioParams *audio_hw_params)
 {
@@ -25,7 +26,7 @@ int Audio::audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int 
     wanted_spec.channels = wanted_nb_channels;
     wanted_spec.freq = wanted_sample_rate;
     if (wanted_spec.freq <= 0 || wanted_spec.channels <= 0) {
-        std::cout<<"FATAL ERROR: Invalid sample rate or channel count!"<<std::endl;
+        Log::error() << "Invalid sample rate or channel count!";
         return -1;
     }
     while (next_sample_rate_idx && next_sample_rates[next_sample_rate_idx] >= wanted_spec.freq)
@@ -41,21 +42,21 @@ int Audio::audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int 
             wanted_spec.freq = next_sample_rates[next_sample_rate_idx--];
             wanted_spec.channels = wanted_nb_channels;
             if (!wanted_spec.freq) {
-                std::cout<<"FATAL ERROR: Could not open audio device!"<<std::endl;
+                Log::error() << "Could not open audio device!";
                 return -1;
             }
         }
         av_channel_layout_default(wanted_channel_layout, wanted_spec.channels);
     }
     if (spec.format != AUDIO_S16SYS) {
-        std::cout<<"SDL adviced audio format is not supported: "<<spec.format<<std::endl;
+        Log::error() << "SDL advised audio format is not supported: " << spec.format;
         return -1;
     }
     if (spec.channels != wanted_spec.channels) {
         av_channel_layout_uninit(wanted_channel_layout);
         av_channel_layout_default(wanted_channel_layout, spec.channels);
         if (wanted_channel_layout->order != AV_CHANNEL_ORDER_NATIVE) {
-            std::cout<<"SDL adviced channel layout is not supported: "<<spec.channels<<std::endl;
+            Log::error() << "SDL advised channel layout is not supported: " << spec.channels;
             return -1;
         }
     }
@@ -67,7 +68,7 @@ int Audio::audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int 
     audio_hw_params->frame_size = av_samples_get_buffer_size(NULL, audio_hw_params->ch_layout.nb_channels, 1, audio_hw_params->fmt, 1);
     audio_hw_params->bytes_per_sec = av_samples_get_buffer_size(NULL, audio_hw_params->ch_layout.nb_channels, audio_hw_params->freq, audio_hw_params->fmt, 1);
     if (audio_hw_params->bytes_per_sec <= 0 || audio_hw_params->frame_size <= 0) {
-        std::cout<<"FATAL ERROR: av_samples_get_buffer_size() failed!"<<std::endl;
+        Log::error() << "av_samples_get_buffer_size() failed!";
         return -1;
     }
     return spec.size;
@@ -170,7 +171,7 @@ int Audio::audio_decode_frame(VideoState *videostate)
         );
         if (ret < 0 || swr_init(videostate->swr_ctx) < 0)
         {
-            std::cout<<"ERROR: Could not create audio resampler context!"<<std::endl;
+            Log::error() << "Could not create audio resampler context!";
             swr_free(&videostate->swr_ctx);
             return -1;
         }
@@ -187,13 +188,13 @@ int Audio::audio_decode_frame(VideoState *videostate)
         int out_size  = av_samples_get_buffer_size(NULL, videostate->audio_tgt.ch_layout.nb_channels, out_count, videostate->audio_tgt.fmt, 0);
         int len2;
         if (out_size < 0) {
-            std::cout<<"FATAL ERROR: av_samples_get_buffer_size() failed!"<<std::endl;
+            Log::error() << "av_samples_get_buffer_size() failed!";
             return -1;
         }
         if (wanted_nb_samples != af->frame->nb_samples) {
             if (swr_set_compensation(videostate->swr_ctx, (wanted_nb_samples - af->frame->nb_samples) * videostate->audio_tgt.freq / af->frame->sample_rate,
                                         wanted_nb_samples * videostate->audio_tgt.freq / af->frame->sample_rate) < 0) {
-                std::cout<<"FATAL ERROR: swr_set_compensation() failed!"<<std::endl;
+                Log::error() << "swr_set_compensation() failed!";
                 return -1;
             }
         }
@@ -202,11 +203,11 @@ int Audio::audio_decode_frame(VideoState *videostate)
             return AVERROR(ENOMEM);
         len2 = swr_convert(videostate->swr_ctx, out, out_count, in, af->frame->nb_samples);
         if (len2 < 0) {
-            std::cout<<"FATAL ERROR: swr_convert() failed!"<<std::endl;
+            Log::error() << "swr_convert() failed!";
             return -1;
         }
         if (len2 == out_count) {
-            std::cout<<"ERROR: Audio buffer probably too small."<<std::endl;
+            Log::warn() << "Audio buffer probably too small.";
             if (swr_init(videostate->swr_ctx) < 0)
                 swr_free(&videostate->swr_ctx);
         }

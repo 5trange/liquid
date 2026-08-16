@@ -3,6 +3,7 @@
 */
 
 #include "queue/packetqueue.hpp"
+#include "utils/Log.hpp"
 
 /*
 **  Functions
@@ -16,12 +17,12 @@ int packet_queue_init(PacketQueue *q)
         return AVERROR(ENOMEM);
     q->mutex = SDL_CreateMutex();
     if (!q->mutex) {
-        std::cout<<"FATAL ERROR: SDL_CreateMutex() failed!"<<SDL_GetError()<<std::endl;
+        Log::error() << "SDL_CreateMutex() failed: " << SDL_GetError();
         return AVERROR(ENOMEM);
     }
     q->cond = SDL_CreateCond();
     if (!q->cond) {
-        std::cout<<"FATAL ERROR: SDL_CreateCond() failed!"<<SDL_GetError()<<std::endl;
+        Log::error() << "SDL_CreateCond() failed: " << SDL_GetError();
         return AVERROR(ENOMEM);
     }
     q->abort_request = 1;

@@ -4,6 +4,7 @@
 
 #include "state/datastate.hpp"
 #include "Stream.hpp"
+#include "gl/VideoRenderer.hpp"
 
 /*
 **  Globals
@@ -49,10 +50,8 @@ int screen_left = SDL_WINDOWPOS_CENTERED;
 int screen_top = SDL_WINDOWPOS_CENTERED;
 
 AVFormatContext* avformat_ctx;
-SDL_RendererFlip need_flip;
 
 SDL_Window *window;
-SDL_Renderer *renderer;
 SDL_GLContext context;
 
 
@@ -74,8 +73,9 @@ void do_exit(VideoState *videostate)
     if (videostate) {
         Stream::stream_close(videostate);
     }
-    if (renderer)
-        SDL_DestroyRenderer(renderer);
+    VideoRenderer::destroy();
+    if (context)
+        SDL_GL_DeleteContext(context);
     if (window)
         SDL_DestroyWindow(window);
 

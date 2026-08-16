@@ -3,6 +3,8 @@
 #include "Video.hpp"
 #include "utils/Clock.hpp"
 #include "Stream.hpp"
+#include "gl/VideoRenderer.hpp"
+#include "utils/Log.hpp"
 
 int step;
 double pos;
@@ -19,7 +21,7 @@ void Event::event_loop(VideoState *videostate)
 
         switch (event.type) {
         case SDL_KEYDOWN:
-            if (exit_on_keydown || event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_q) {
+            if (exit_on_keydown || event.key.keysym.sym == SDLK_q) {
                 do_exit(videostate);
                 break;
             }
@@ -27,6 +29,13 @@ void Event::event_loop(VideoState *videostate)
             if (!videostate->width)
                 continue;
             switch (event.key.keysym.sym) {
+            case SDLK_ESCAPE:
+                // Only exits fullscreen, doesn't quit - use Q to quit.
+                if (is_full_screen) {
+                    Event::toggle_full_screen(videostate);
+                    videostate->force_refresh = 1;
+                }
+                break;
             case SDLK_f:
                 Event::toggle_full_screen(videostate);
                 videostate->force_refresh = 1;
@@ -70,6 +79,24 @@ void Event::event_loop(VideoState *videostate)
                 break;
             case SDLK_t:
                 Event::stream_cycle_channel(videostate, AVMEDIA_TYPE_SUBTITLE);
+                break;
+            case SDLK_u:
+                // Deliberately NOT setting force_refresh here: while paused
+                // that would make refresh_loop_wait_event() call
+                // Video::video_refresh(), which doesn't check pause state
+                // before comparing wall-clock time against the current
+                // frame's schedule - since real time kept moving while
+                // paused, it looks "overdue" and advances the frame queue.
+                // The paused branch already redraws the current frame every
+                // ~10ms regardless, so the toggle shows up on its own.
+                VideoRenderer::toggle_fsr();
+                Log::info() << "FSR upscaling " << (VideoRenderer::fsr_enabled() ? "ON" : "OFF");
+                break;
+            case SDLK_r:
+                // Same reasoning as SDLK_u above: no force_refresh, the
+                // paused branch's unconditional redraw picks it up on its own.
+                VideoRenderer::cycle_render_scale();
+                Log::info() << "FSR quality preset: " << VideoRenderer::render_scale_name();
                 break;
             case SDLK_PAGEUP:
                 if (videostate->ic->nb_chapters <= 1) {
@@ -152,7 +179,7 @@ void Event::event_loop(VideoState *videostate)
                     hh   = ns / 3600;
                     mm   = (ns % 3600) / 60;
                     ss   = (ns % 60);
-                    std::cout<<"Seeking to "<<frac*100<<":"<<hh<<":"<<mm<<":"<<ss<<":"<<thh<<":"<<tmm<<":"<<tss<<std::endl;
+                    Log::info() << "Seeking to " << frac*100 << ":" << hh << ":" << mm << ":" << ss << ":" << thh << ":" << tmm << ":" << tss;
                     ts = frac * videostate->ic->duration;
                     if (videostate->ic->start_time != AV_NOPTS_VALUE)
                         ts += videostate->ic->start_time;
@@ -199,7 +226,7 @@ void Event::refresh_loop_wait_event(VideoState *videostate, SDL_Event *event)
         if(videostate->paused){
             if (videostate->video_st)
                 Video::video_image_display(videostate);
-            SDL_RenderPresent(renderer);
+            Video::present();
         }
 
         SDL_PumpEvents();
@@ -306,7 +333,7 @@ void Event::stream_cycle_channel(VideoState *videostate, int codec_type)
  the_end:
     if (p && stream_index != -1)
         stream_index = p->stream_index[stream_index];
-    std::cout<<"LOG: Switching stream from "<<old_index<<" to "<<stream_index<<std::endl;
+    Log::info() << "Switching stream from " << old_index << " to " << stream_index;
     Stream::stream_component_close(videostate, old_index);
     Stream::stream_component_open(videostate, stream_index);
 }
@@ -333,7 +360,7 @@ void Event::seek_chapter(VideoState *videostate, int incr)
     if (i >= videostate->ic->nb_chapters)
         return;
 
-    std::cout<<"LOG: Seeking to chapter "<<i<<std::endl;
+    Log::info() << "Seeking to chapter " << i;
     SeekPause::stream_seek(videostate, av_rescale_q(videostate->ic->chapters[i]->start, videostate->ic->chapters[i]->time_base,
                                  AV_TIME_BASE_Q), 0, 0);
 }
