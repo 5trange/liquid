@@ -8,6 +8,7 @@
 #include <ios>
 #include <vector>
 #include <string>
+#include <cstring>
 
 namespace {
 
@@ -547,6 +548,8 @@ GLuint g_vao_static = 0, g_vbo_static = 0;   // fixed fullscreen quad: decode + 
 GLuint g_vao_composite = 0, g_vbo_composite = 0; // positioned into `rect`: final RCAS pass
 GLuint g_vao_text = 0, g_vbo_text = 0;       // dynamic glyph quads for the overlay toast
 GLuint g_vao_box = 0, g_vbo_box = 0;         // background box behind the overlay text
+GLuint g_vao_help_text = 0, g_vbo_help_text = 0; // glyph quads for the help panel
+GLuint g_vao_help_box = 0, g_vbo_help_box = 0;   // background box behind the help panel
 
 GLuint g_tex_y = 0, g_tex_u = 0, g_tex_v = 0;
 int g_y_w = 0, g_y_h = 0;
@@ -579,10 +582,43 @@ const int kMaxOverlayChars = 64;
 const double kOverlayHoldSeconds = 1.0;
 const double kOverlayFadeSeconds = 0.4;
 
+std::string g_overlay_text;
 int g_overlay_char_count = 0;
 int g_overlay_box_w = 0, g_overlay_box_h = 0;
 int64_t g_overlay_start_us = 0;
 bool g_overlay_active = false;
+
+// Help panel: same font/box shaders as the toast, but persistent (toggled,
+// not timed) and multi-line, so it needs its own geometry buffers rather
+// than sharing the toast's - both can be on screen at once (e.g. pressing a
+// shortcut while the help panel is open).
+const char *kHelpLines[] = {
+    "KEYBOARD SHORTCUTS   (H to close)",
+    "",
+    "Q             Quit",
+    "Esc           Exit fullscreen",
+    "F             Toggle fullscreen",
+    "P / Space     Play / pause",
+    "M             Mute",
+    "S             Step one frame",
+    "* / 0         Volume up",
+    "/ / 9         Volume down",
+    "A             Cycle audio track",
+    "V             Cycle video track",
+    "T             Cycle subtitle track",
+    "C             Cycle all tracks",
+    "U             Cycle upscaler",
+    "R             Cycle scale preset",
+    "Left / Right  Seek -10s / +10s",
+    "Up / Down     Seek +60s / -60s",
+    "PageUp/Down   Next / prev chapter",
+};
+const int kHelpLineCount = sizeof(kHelpLines) / sizeof(kHelpLines[0]);
+const int kMaxHelpChars = 600; // real content is ~510 chars, some headroom
+
+bool g_help_active = false;
+int g_help_char_count = 0;
+int g_help_box_w = 0, g_help_box_h = 0;
 
 float g_sharpness = 0.2f; // AMD's "stops" convention: 0.0 = max sharpness
 float g_nis_sharpness = 0.5f; // NIS's own [0,1] convention: 0.5 is its documented neutral default
@@ -771,6 +807,31 @@ bool VideoRenderer::init()
     gl::EnableVertexAttribArray(1);
     gl::BindVertexArray(0);
 
+    // Help panel's own box + glyph buffers (see kHelpLines) - separate from
+    // the toast's so both can be visible at once without clobbering each
+    // other.
+    gl::GenVertexArrays(1, &g_vao_help_box);
+    gl::GenBuffers(1, &g_vbo_help_box);
+    gl::BindVertexArray(g_vao_help_box);
+    gl::BindBuffer(GL_ARRAY_BUFFER, g_vbo_help_box);
+    gl::BufferData(GL_ARRAY_BUFFER, sizeof(float) * 16, NULL, GL_DYNAMIC_DRAW);
+    gl::VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
+    gl::EnableVertexAttribArray(0);
+    gl::VertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+    gl::EnableVertexAttribArray(1);
+    gl::BindVertexArray(0);
+
+    gl::GenVertexArrays(1, &g_vao_help_text);
+    gl::GenBuffers(1, &g_vbo_help_text);
+    gl::BindVertexArray(g_vao_help_text);
+    gl::BindBuffer(GL_ARRAY_BUFFER, g_vbo_help_text);
+    gl::BufferData(GL_ARRAY_BUFFER, sizeof(float) * 4 * 6 * kMaxHelpChars, NULL, GL_DYNAMIC_DRAW);
+    gl::VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
+    gl::EnableVertexAttribArray(0);
+    gl::VertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+    gl::EnableVertexAttribArray(1);
+    gl::BindVertexArray(0);
+
     gl::GenFramebuffers(1, &g_fbo_decode);
     gl::GenFramebuffers(1, &g_fbo_upscale);
     gl::GenFramebuffers(1, &g_fbo_downscale);
@@ -860,6 +921,10 @@ void VideoRenderer::destroy()
     if (g_vao_text) gl::DeleteVertexArrays(1, &g_vao_text);
     if (g_vbo_box) gl::DeleteBuffers(1, &g_vbo_box);
     if (g_vao_box) gl::DeleteVertexArrays(1, &g_vao_box);
+    if (g_vbo_help_text) gl::DeleteBuffers(1, &g_vbo_help_text);
+    if (g_vao_help_text) gl::DeleteVertexArrays(1, &g_vao_help_text);
+    if (g_vbo_help_box) gl::DeleteBuffers(1, &g_vbo_help_box);
+    if (g_vao_help_box) gl::DeleteVertexArrays(1, &g_vao_help_box);
     if (g_program_decode_yuv) gl::DeleteProgram(g_program_decode_yuv);
     if (g_program_decode_rgba) gl::DeleteProgram(g_program_decode_rgba);
     if (g_program_easu) gl::DeleteProgram(g_program_easu);
@@ -874,10 +939,12 @@ void VideoRenderer::destroy()
     g_fbo_decode = g_fbo_upscale = g_fbo_downscale = 0;
     g_vbo_static = g_vao_static = g_vbo_composite = g_vao_composite = 0;
     g_vbo_text = g_vao_text = g_vbo_box = g_vao_box = 0;
+    g_vbo_help_text = g_vao_help_text = g_vbo_help_box = g_vao_help_box = 0;
     g_program_decode_yuv = g_program_decode_rgba = g_program_easu = g_program_rcas = g_program_nis = 0;
     g_program_text = g_program_flat = 0;
     g_y_w = g_y_h = g_uv_w = g_uv_h = g_rgba_w = g_rgba_h = 0;
     g_decode_w = g_decode_h = g_upscale_w = g_upscale_h = g_downscale_w = g_downscale_h = 0;
+    g_help_active = false;
     g_overlay_active = false;
 }
 
@@ -1212,6 +1279,7 @@ void VideoRenderer::draw(const SDL_Rect &rect, int drawable_w, int drawable_h, b
     gl::BindVertexArray(0);
 
     draw_overlay(drawable_w, drawable_h);
+    draw_help(drawable_w, drawable_h);
 
     GLenum err;
     while ((err = glGetError()) != GL_NO_ERROR)
@@ -1228,14 +1296,28 @@ void VideoRenderer::set_sharpness(float sharpness)
 
 void VideoRenderer::show_overlay(const std::string &text)
 {
+    g_overlay_text = text.substr(0, kMaxOverlayChars);
+    g_overlay_start_us = av_gettime_relative();
+    g_overlay_active = !g_overlay_text.empty();
+}
+
+// Rebuilds the toast's glyph quads from g_overlay_text every time it's
+// about to be drawn (not just when show_overlay() was called) - the NDC
+// positions bake in the drawable size at build time, so if the window
+// resizes (or fullscreen is toggled) while a toast happens to still be
+// fading, stale geometry sized for the old drawable would render at the
+// wrong scale in the new one. Rebuilding is cheap (a handful of quads), so
+// it's simplest to just always do it fresh.
+void VideoRenderer::build_overlay_geometry()
+{
     int drawable_w = 0, drawable_h = 0;
     SDL_GL_GetDrawableSize(window, &drawable_w, &drawable_h);
-    if (drawable_w <= 0 || drawable_h <= 0)
+    if (drawable_w <= 0 || drawable_h <= 0) {
+        g_overlay_char_count = 0;
         return;
+    }
 
-    int count = (int)text.size();
-    if (count > kMaxOverlayChars)
-        count = kMaxOverlayChars;
+    int count = (int)g_overlay_text.size();
 
     if (count > 0) {
         std::vector<float> verts;
@@ -1245,7 +1327,7 @@ void VideoRenderer::show_overlay(const std::string &text)
         int textY0 = kOverlayMarginPx + kOverlayPaddingPx;
 
         for (int i = 0; i < count; i++) {
-            unsigned char c = (unsigned char)text[i];
+            unsigned char c = (unsigned char)g_overlay_text[i];
             int glyph = (c < 128) ? c : 32; // anything outside ASCII falls back to space
             int col = glyph % kFontCols;
             int row = glyph / kFontCols;
@@ -1286,8 +1368,6 @@ void VideoRenderer::show_overlay(const std::string &text)
     g_overlay_char_count = count;
     g_overlay_box_w = kOverlayPaddingPx * 2 + count * kGlyphCell;
     g_overlay_box_h = kOverlayPaddingPx * 2 + kGlyphCell;
-    g_overlay_start_us = av_gettime_relative();
-    g_overlay_active = count > 0;
 }
 
 void VideoRenderer::draw_overlay(int drawable_w, int drawable_h)
@@ -1300,6 +1380,8 @@ void VideoRenderer::draw_overlay(int drawable_w, int drawable_h)
         g_overlay_active = false;
         return;
     }
+
+    build_overlay_geometry();
 
     float alpha = 1.0f;
     if (elapsed > kOverlayHoldSeconds)
@@ -1345,6 +1427,135 @@ void VideoRenderer::draw_overlay(int drawable_w, int drawable_h)
         gl::Uniform1f(g_loc_text_alpha, alpha);
         gl::BindVertexArray(g_vao_text);
         glDrawArrays(GL_TRIANGLES, 0, g_overlay_char_count * 6);
+    }
+
+    gl::BindVertexArray(0);
+    glDisable(GL_BLEND);
+}
+
+void VideoRenderer::build_help_geometry()
+{
+    int drawable_w = 0, drawable_h = 0;
+    SDL_GL_GetDrawableSize(window, &drawable_w, &drawable_h);
+    if (drawable_w <= 0 || drawable_h <= 0)
+        return;
+
+    std::vector<float> verts;
+    int maxLineLen = 0;
+    int totalChars = 0;
+
+    int textX0 = kOverlayMarginPx + kOverlayPaddingPx;
+    int textY0 = kOverlayMarginPx + kOverlayPaddingPx;
+
+    for (int line = 0; line < kHelpLineCount; line++) {
+        const char *text = kHelpLines[line];
+        int len = (int)strlen(text);
+        if (len > maxLineLen)
+            maxLineLen = len;
+
+        for (int i = 0; i < len && totalChars < kMaxHelpChars; i++) {
+            unsigned char c = (unsigned char)text[i];
+            int glyph = (c < 128) ? c : 32;
+            int col = glyph % kFontCols;
+            int row = glyph / kFontCols;
+            float u0 = (float)col / kFontCols;
+            float v0 = (float)row / kFontRows;
+            float u1 = (float)(col + 1) / kFontCols;
+            float v1 = (float)(row + 1) / kFontRows;
+
+            float px0 = (float)(textX0 + i * kGlyphCell);
+            float py0 = (float)(textY0 + line * kGlyphCell);
+            float px1 = px0 + kGlyphCell;
+            float py1 = py0 + kGlyphCell;
+
+            float x0 = (px0 / drawable_w) * 2.0f - 1.0f;
+            float x1 = (px1 / drawable_w) * 2.0f - 1.0f;
+            float y0 = 1.0f - (py0 / drawable_h) * 2.0f;
+            float y1 = 1.0f - (py1 / drawable_h) * 2.0f;
+
+            float quad[24] = {
+                x0, y0, u0, v0,
+                x1, y0, u1, v0,
+                x0, y1, u0, v1,
+
+                x1, y0, u1, v0,
+                x1, y1, u1, v1,
+                x0, y1, u0, v1,
+            };
+            verts.insert(verts.end(), quad, quad + 24);
+            totalChars++;
+        }
+    }
+
+    if (!verts.empty()) {
+        gl::BindBuffer(GL_ARRAY_BUFFER, g_vbo_help_text);
+        gl::BufferSubData(GL_ARRAY_BUFFER, 0, verts.size() * sizeof(float), verts.data());
+    }
+
+    g_help_char_count = totalChars;
+    g_help_box_w = kOverlayPaddingPx * 2 + maxLineLen * kGlyphCell;
+    g_help_box_h = kOverlayPaddingPx * 2 + kHelpLineCount * kGlyphCell;
+}
+
+void VideoRenderer::toggle_help()
+{
+    g_help_active = !g_help_active;
+}
+
+bool VideoRenderer::help_visible()
+{
+    return g_help_active;
+}
+
+void VideoRenderer::draw_help(int drawable_w, int drawable_h)
+{
+    if (!g_help_active)
+        return;
+
+    // Rebuilt every frame while visible (not just on toggle-on) - see
+    // build_overlay_geometry()'s comment for why: otherwise stale geometry
+    // sized for a since-resized drawable renders at the wrong scale, which
+    // is exactly what toggling fullscreen while the panel is open used to do.
+    build_help_geometry();
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    {
+        float bx0 = (float)kOverlayMarginPx;
+        float by0 = (float)kOverlayMarginPx;
+        float bx1 = bx0 + g_help_box_w;
+        float by1 = by0 + g_help_box_h;
+
+        float x0 = (bx0 / drawable_w) * 2.0f - 1.0f;
+        float x1 = (bx1 / drawable_w) * 2.0f - 1.0f;
+        float y0 = 1.0f - (by0 / drawable_h) * 2.0f;
+        float y1 = 1.0f - (by1 / drawable_h) * 2.0f;
+
+        float verts[16] = {
+            x0, y0, 0.0f, 0.0f,
+            x1, y0, 1.0f, 0.0f,
+            x0, y1, 0.0f, 1.0f,
+            x1, y1, 1.0f, 1.0f,
+        };
+        gl::BindBuffer(GL_ARRAY_BUFFER, g_vbo_help_box);
+        gl::BufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+
+        gl::UseProgram(g_program_flat);
+        gl::Uniform4f(g_loc_flat_color, 0.0f, 0.0f, 0.0f, 0.75f); // a bit more opaque than the toast - this one stays up
+        gl::BindVertexArray(g_vao_help_box);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+
+    if (g_help_char_count > 0) {
+        gl::UseProgram(g_program_text);
+        gl::ActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_tex_font_atlas);
+        gl::Uniform1i(g_loc_text_atlas, 0);
+        gl::Uniform3f(g_loc_text_color, 1.0f, 1.0f, 1.0f);
+        gl::Uniform1f(g_loc_text_alpha, 1.0f);
+        gl::BindVertexArray(g_vao_help_text);
+        glDrawArrays(GL_TRIANGLES, 0, g_help_char_count * 6);
     }
 
     gl::BindVertexArray(0);

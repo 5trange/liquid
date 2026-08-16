@@ -6,11 +6,33 @@
 #include "gl/VideoRenderer.hpp"
 #include "utils/Log.hpp"
 #include <string>
+#include <cstdio>
 
 int step;
 double pos;
 double incr;
 double frac;
+
+namespace {
+
+// Logs and shows an on-screen toast for the same message - the pattern
+// every state-changing key handler below wants, so player actions (pause,
+// volume, seek, stream switches, upscaler/scale changes) get visible
+// feedback instead of only a console line nobody's looking at.
+void show_toast(const std::string &msg)
+{
+    Log::info() << msg;
+    VideoRenderer::show_overlay(msg);
+}
+
+std::string fmt_seek(double seconds)
+{
+    char buf[32];
+    snprintf(buf, sizeof buf, "Seek: %+.0fs", seconds);
+    return buf;
+}
+
+} // namespace
 
 void Event::event_loop(VideoState *videostate)
 {
@@ -44,19 +66,23 @@ void Event::event_loop(VideoState *videostate)
             case SDLK_p:
             case SDLK_SPACE:
                 Event::toggle_pause(videostate);
+                show_toast(videostate->paused ? "Paused" : "Playing");
                 break;
             case SDLK_m:
                 Event::toggle_mute(videostate);
+                show_toast(videostate->muted ? "Muted" : "Unmuted");
                 break;
             case SDLK_KP_MULTIPLY:
             case SDLK_0:
                 step = 1;
                 Event::update_volume(videostate);
+                show_toast("Volume: " + std::to_string(videostate->audio_volume * 100 / SDL_MIX_MAXVOLUME) + "%");
                 break;
             case SDLK_KP_DIVIDE:
             case SDLK_9:
                 step = -1;
                 Event::update_volume(videostate);
+                show_toast("Volume: " + std::to_string(videostate->audio_volume * 100 / SDL_MIX_MAXVOLUME) + "%");
                 break;
             case SDLK_s: // S: Step to next frame
                 SeekPause::step_to_next_frame(videostate);
@@ -91,26 +117,24 @@ void Event::event_loop(VideoState *videostate)
                 // The paused branch already redraws the current frame every
                 // ~10ms regardless, so the toggle shows up on its own.
                 VideoRenderer::cycle_upscaler();
-                {
-                    std::string msg = std::string("Upscaler: ") + VideoRenderer::upscaler_name();
-                    Log::info() << msg;
-                    VideoRenderer::show_overlay(msg);
-                }
+                show_toast(std::string("Upscaler: ") + VideoRenderer::upscaler_name());
                 break;
             case SDLK_r:
                 // Same reasoning as SDLK_u above: no force_refresh, the
                 // paused branch's unconditional redraw picks it up on its own.
                 VideoRenderer::cycle_render_scale();
-                {
-                    std::string msg = std::string("Scale preset: ") + VideoRenderer::render_scale_name();
-                    Log::info() << msg;
-                    VideoRenderer::show_overlay(msg);
-                }
+                show_toast(std::string("Scale preset: ") + VideoRenderer::render_scale_name());
+                break;
+            case SDLK_h:
+                // No force_refresh needed here either - same reasoning as
+                // SDLK_u/SDLK_r.
+                VideoRenderer::toggle_help();
                 break;
             case SDLK_PAGEUP:
                 if (videostate->ic->nb_chapters <= 1) {
                     incr = 600.0;
                     SeekPause::execute_seek(videostate, incr);
+                    show_toast(fmt_seek(incr));
                 }
                 Event::seek_chapter(videostate, 1);
                 break;
@@ -118,24 +142,29 @@ void Event::event_loop(VideoState *videostate)
                 if (videostate->ic->nb_chapters <= 1) {
                     incr = -600.0;
                     SeekPause::execute_seek(videostate, incr);
+                    show_toast(fmt_seek(incr));
                 }
                 Event::seek_chapter(videostate, -1);
                 break;
             case SDLK_LEFT:
                 incr = seek_interval ? -seek_interval : -10.0;
                 SeekPause::execute_seek(videostate, incr);
+                show_toast(fmt_seek(incr));
                 break;
             case SDLK_RIGHT:
                 incr = seek_interval ? seek_interval : 10.0;
                 SeekPause::execute_seek(videostate, incr);
+                show_toast(fmt_seek(incr));
                 break;
             case SDLK_UP:
                 incr = 60.0;
                 SeekPause::execute_seek(videostate, incr);
+                show_toast(fmt_seek(incr));
                 break;
             case SDLK_DOWN:
                 incr = -60.0;
                 SeekPause::execute_seek(videostate, incr);
+                show_toast(fmt_seek(incr));
                 break;
             default:
                 break;
@@ -344,9 +373,15 @@ void Event::stream_cycle_channel(VideoState *videostate, int codec_type)
  the_end:
     if (p && stream_index != -1)
         stream_index = p->stream_index[stream_index];
-    Log::info() << "Switching stream from " << old_index << " to " << stream_index;
     Stream::stream_component_close(videostate, old_index);
     Stream::stream_component_open(videostate, stream_index);
+
+    const char *type_name = (codec_type == AVMEDIA_TYPE_AUDIO) ? "Audio" :
+                             (codec_type == AVMEDIA_TYPE_VIDEO) ? "Video" : "Subtitle";
+    if (stream_index == -1)
+        show_toast(std::string(type_name) + ": off");
+    else
+        show_toast(std::string(type_name) + " stream: " + std::to_string(stream_index));
 }
 
 void Event::seek_chapter(VideoState *videostate, int incr)
@@ -371,7 +406,7 @@ void Event::seek_chapter(VideoState *videostate, int incr)
     if (i >= videostate->ic->nb_chapters)
         return;
 
-    Log::info() << "Seeking to chapter " << i;
+    show_toast("Chapter " + std::to_string(i));
     SeekPause::stream_seek(videostate, av_rescale_q(videostate->ic->chapters[i]->start, videostate->ic->chapters[i]->time_base,
                                  AV_TIME_BASE_Q), 0, 0);
 }

@@ -68,6 +68,13 @@ class VideoRenderer
         // renders as spaces.
         static void show_overlay(const std::string &text);
 
+        // Toggles a persistent (not timed) keyboard-shortcut reference panel,
+        // top-left corner, listing everything bound in Event.cpp. Unlike
+        // show_overlay(), stays up until toggled off again rather than
+        // fading, and can be shown at the same time as a toast.
+        static void toggle_help();
+        static bool help_visible();
+
     private:
         static bool ensure_yuv_textures(int width, int height);
         static bool ensure_rgba_texture(int width, int height);
@@ -75,5 +82,8 @@ class VideoRenderer
         static bool ensure_upscale_target(int width, int height);
         static bool ensure_downscale_target(int width, int height);
         static void set_composite_quad(const SDL_Rect &rect, int drawable_w, int drawable_h);
+        static void build_overlay_geometry();
         static void draw_overlay(int drawable_w, int drawable_h);
+        static void build_help_geometry();
+        static void draw_help(int drawable_w, int drawable_h);
 };
