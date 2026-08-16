@@ -2,6 +2,7 @@
 
 #include "state/datastate.hpp"
 #include "gl/GLLoader.hpp"
+#include <string>
 
 // Owns every GL object used to turn decoded video frames into upscaled
 // pixels on screen. Three passes per frame:
@@ -61,6 +62,12 @@ class VideoRenderer
         static void cycle_render_scale();
         static const char *render_scale_name();
 
+        // Shows a short toast (translucent box + text, top-left corner) for
+        // about a second before fading out over ~0.4s. Call again to replace
+        // whatever's currently showing/fading. Text outside printable ASCII
+        // renders as spaces.
+        static void show_overlay(const std::string &text);
+
     private:
         static bool ensure_yuv_textures(int width, int height);
         static bool ensure_rgba_texture(int width, int height);
@@ -68,4 +75,5 @@ class VideoRenderer
         static bool ensure_upscale_target(int width, int height);
         static bool ensure_downscale_target(int width, int height);
         static void set_composite_quad(const SDL_Rect &rect, int drawable_w, int drawable_h);
+        static void draw_overlay(int drawable_w, int drawable_h);
 };

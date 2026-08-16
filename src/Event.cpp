@@ -5,6 +5,7 @@
 #include "Stream.hpp"
 #include "gl/VideoRenderer.hpp"
 #include "utils/Log.hpp"
+#include <string>
 
 int step;
 double pos;
@@ -90,13 +91,21 @@ void Event::event_loop(VideoState *videostate)
                 // The paused branch already redraws the current frame every
                 // ~10ms regardless, so the toggle shows up on its own.
                 VideoRenderer::cycle_upscaler();
-                Log::info() << "Upscaler: " << VideoRenderer::upscaler_name();
+                {
+                    std::string msg = std::string("Upscaler: ") + VideoRenderer::upscaler_name();
+                    Log::info() << msg;
+                    VideoRenderer::show_overlay(msg);
+                }
                 break;
             case SDLK_r:
                 // Same reasoning as SDLK_u above: no force_refresh, the
                 // paused branch's unconditional redraw picks it up on its own.
                 VideoRenderer::cycle_render_scale();
-                Log::info() << "FSR quality preset: " << VideoRenderer::render_scale_name();
+                {
+                    std::string msg = std::string("Scale preset: ") + VideoRenderer::render_scale_name();
+                    Log::info() << msg;
+                    VideoRenderer::show_overlay(msg);
+                }
                 break;
             case SDLK_PAGEUP:
                 if (videostate->ic->nb_chapters <= 1) {

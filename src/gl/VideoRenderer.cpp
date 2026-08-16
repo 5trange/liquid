@@ -1,9 +1,12 @@
 #include "gl/VideoRenderer.hpp"
 #include "gl/Shader.hpp"
 #include "gl/NISCoefficients.hpp"
+#include "gl/Font8x8.hpp"
+#include "gl/FSRCNNRenderer.hpp"
 #include "utils/Log.hpp"
 #include <ios>
 #include <vector>
+#include <string>
 
 namespace {
 
@@ -493,11 +496,37 @@ const char *fragment_src_nis =
     "    FragColor = vec4(clamp(op.rgb, 0.0, 1.0), 1.0);\n"
     "}\n";
 
+// Overlay glyph shader: samples the font atlas's red channel as alpha over a
+// flat color, for the "which upscaler is active" toast.
+const char *fragment_src_text =
+    "#version 330 core\n"
+    "in vec2 vTexCoord;\n"
+    "out vec4 FragColor;\n"
+    "uniform sampler2D uAtlas;\n"
+    "uniform vec3 uColor;\n"
+    "uniform float uAlpha;\n"
+    "void main() {\n"
+    "    float a = texture(uAtlas, vTexCoord).r * uAlpha;\n"
+    "    FragColor = vec4(uColor, a);\n"
+    "}\n";
+
+// Flat translucent box behind the overlay text, for legibility over
+// arbitrary video content.
+const char *fragment_src_flat =
+    "#version 330 core\n"
+    "out vec4 FragColor;\n"
+    "uniform vec4 uColor;\n"
+    "void main() {\n"
+    "    FragColor = uColor;\n"
+    "}\n";
+
 GLuint g_program_decode_yuv = 0;
 GLuint g_program_decode_rgba = 0;
 GLuint g_program_easu = 0;
 GLuint g_program_rcas = 0;
 GLuint g_program_nis = 0;
+GLuint g_program_text = 0;
+GLuint g_program_flat = 0;
 
 GLint g_loc_decode_yuv_tex_y = -1, g_loc_decode_yuv_tex_u = -1, g_loc_decode_yuv_tex_v = -1;
 GLint g_loc_decode_yuv_mode = -1, g_loc_decode_yuv_flip = -1;
@@ -510,9 +539,13 @@ GLint g_loc_nis_detect_ratio = -1, g_loc_nis_detect_thres = -1, g_loc_nis_min_co
 GLint g_loc_nis_sharp_start_y = -1, g_loc_nis_sharp_scale_y = -1;
 GLint g_loc_nis_sharp_strength_min = -1, g_loc_nis_sharp_strength_scale = -1;
 GLint g_loc_nis_sharp_limit_min = -1, g_loc_nis_sharp_limit_scale = -1;
+GLint g_loc_text_atlas = -1, g_loc_text_color = -1, g_loc_text_alpha = -1;
+GLint g_loc_flat_color = -1;
 
 GLuint g_vao_static = 0, g_vbo_static = 0;   // fixed fullscreen quad: decode + EASU passes
 GLuint g_vao_composite = 0, g_vbo_composite = 0; // positioned into `rect`: final RCAS pass
+GLuint g_vao_text = 0, g_vbo_text = 0;       // dynamic glyph quads for the overlay toast
+GLuint g_vao_box = 0, g_vbo_box = 0;         // background box behind the overlay text
 
 GLuint g_tex_y = 0, g_tex_u = 0, g_tex_v = 0;
 int g_y_w = 0, g_y_h = 0;
@@ -535,11 +568,27 @@ int g_downscale_w = 0, g_downscale_h = 0;
 
 GLuint g_tex_nis_coef_scale = 0, g_tex_nis_coef_usm = 0;
 
+GLuint g_tex_font_atlas = 0;
+const int kFontCols = 16, kFontRows = 8; // 128 glyphs, 16x8 grid, 8x8 px each
+const int kGlyphScale = 3;               // on-screen glyph size = 8*3 = 24px
+const int kGlyphCell = 8 * kGlyphScale;
+const int kOverlayMarginPx = 16;
+const int kOverlayPaddingPx = 8;
+const int kMaxOverlayChars = 64;
+const double kOverlayHoldSeconds = 1.0;
+const double kOverlayFadeSeconds = 0.4;
+
+int g_overlay_char_count = 0;
+int g_overlay_box_w = 0, g_overlay_box_h = 0;
+int64_t g_overlay_start_us = 0;
+bool g_overlay_active = false;
+
 float g_sharpness = 0.2f; // AMD's "stops" convention: 0.0 = max sharpness
 float g_nis_sharpness = 0.5f; // NIS's own [0,1] convention: 0.5 is its documented neutral default
 
-enum class UpscalerMode { Bilinear, FSR1, NIS };
-const char *kUpscalerNames[] = { "Bilinear (off)", "FSR1 (EASU+RCAS)", "NIS" };
+enum class UpscalerMode { Bilinear, FSR1, NIS, FSRCNN };
+const int kUpscalerModeCount = 4;
+const char *kUpscalerNames[] = { "Bilinear (off)", "FSR1 (EASU+RCAS)", "NIS", "FSRCNN" };
 UpscalerMode g_upscaler_mode = UpscalerMode::FSR1;
 
 // AMD's published FSR1 quality presets: the per-dimension ratio between the
@@ -620,7 +669,10 @@ bool VideoRenderer::init()
     g_program_easu = Shader::compile_program(vertex_src, fragment_src_easu);
     g_program_rcas = Shader::compile_program(vertex_src, fragment_src_rcas);
     g_program_nis = Shader::compile_program(vertex_src, fragment_src_nis);
-    if (!g_program_decode_yuv || !g_program_decode_rgba || !g_program_easu || !g_program_rcas || !g_program_nis)
+    g_program_text = Shader::compile_program(vertex_src, fragment_src_text);
+    g_program_flat = Shader::compile_program(vertex_src, fragment_src_flat);
+    if (!g_program_decode_yuv || !g_program_decode_rgba || !g_program_easu || !g_program_rcas || !g_program_nis
+        || !g_program_text || !g_program_flat)
         return false;
 
     g_loc_decode_yuv_tex_y = gl::GetUniformLocation(g_program_decode_yuv, "uTexY");
@@ -651,6 +703,10 @@ bool VideoRenderer::init()
     g_loc_nis_sharp_strength_scale = gl::GetUniformLocation(g_program_nis, "uSharpStrengthScale");
     g_loc_nis_sharp_limit_min = gl::GetUniformLocation(g_program_nis, "uSharpLimitMin");
     g_loc_nis_sharp_limit_scale = gl::GetUniformLocation(g_program_nis, "uSharpLimitScale");
+    g_loc_text_atlas = gl::GetUniformLocation(g_program_text, "uAtlas");
+    g_loc_text_color = gl::GetUniformLocation(g_program_text, "uColor");
+    g_loc_text_alpha = gl::GetUniformLocation(g_program_text, "uAlpha");
+    g_loc_flat_color = gl::GetUniformLocation(g_program_flat, "uColor");
 
     gl::GenVertexArrays(1, &g_vao_static);
     gl::GenBuffers(1, &g_vbo_static);
@@ -688,6 +744,32 @@ bool VideoRenderer::init()
     gl::EnableVertexAttribArray(1);
     gl::BindVertexArray(0);
 
+    gl::GenVertexArrays(1, &g_vao_box);
+    gl::GenBuffers(1, &g_vbo_box);
+    gl::BindVertexArray(g_vao_box);
+    gl::BindBuffer(GL_ARRAY_BUFFER, g_vbo_box);
+    gl::BufferData(GL_ARRAY_BUFFER, sizeof(float) * 16, NULL, GL_DYNAMIC_DRAW);
+    gl::VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
+    gl::EnableVertexAttribArray(0);
+    gl::VertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+    gl::EnableVertexAttribArray(1);
+    gl::BindVertexArray(0);
+
+    // Text glyph quads: 6 verts (2 triangles, no index buffer) x 4 floats
+    // (pos.xy, uv.xy) per character, capacity for kMaxOverlayChars, rebuilt
+    // whenever show_overlay() is called (not every frame - only the fade
+    // alpha changes per frame, and that's a uniform, not per-vertex data).
+    gl::GenVertexArrays(1, &g_vao_text);
+    gl::GenBuffers(1, &g_vbo_text);
+    gl::BindVertexArray(g_vao_text);
+    gl::BindBuffer(GL_ARRAY_BUFFER, g_vbo_text);
+    gl::BufferData(GL_ARRAY_BUFFER, sizeof(float) * 4 * 6 * kMaxOverlayChars, NULL, GL_DYNAMIC_DRAW);
+    gl::VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
+    gl::EnableVertexAttribArray(0);
+    gl::VertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+    gl::EnableVertexAttribArray(1);
+    gl::BindVertexArray(0);
+
     gl::GenFramebuffers(1, &g_fbo_decode);
     gl::GenFramebuffers(1, &g_fbo_upscale);
     gl::GenFramebuffers(1, &g_fbo_downscale);
@@ -712,14 +794,47 @@ bool VideoRenderer::init()
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, 2, 64, 0, GL_RGBA, GL_FLOAT, nis_coef_usm);
 
+    // Font atlas: unpack the bit-packed 8x8 glyphs into a single-channel
+    // 128x64 texture (16x8 grid of glyphs), glyph index N at cell
+    // (N % 16, N / 16). Row 0 of each glyph is its top row, bit 0 (LSB) of
+    // each row byte is its leftmost pixel - matches font8x8_basic's layout
+    // directly, no repacking needed beyond bit -> byte expansion.
+    {
+        const int atlasW = kFontCols * 8, atlasH = kFontRows * 8;
+        std::vector<unsigned char> atlas(atlasW * atlasH, 0);
+        for (int glyph = 0; glyph < 128; glyph++) {
+            int cellX = (glyph % kFontCols) * 8;
+            int cellY = (glyph / kFontCols) * 8;
+            for (int row = 0; row < 8; row++) {
+                unsigned char bits = font8x8_basic[glyph][row];
+                for (int col = 0; col < 8; col++) {
+                    if ((bits >> col) & 1)
+                        atlas[(cellY + row) * atlasW + (cellX + col)] = 255;
+                }
+            }
+        }
+        glGenTextures(1, &g_tex_font_atlas);
+        glBindTexture(GL_TEXTURE_2D, g_tex_font_atlas);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, atlasW, atlasH, 0, GL_RED, GL_UNSIGNED_BYTE, atlas.data());
+    }
+
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
+
+    if (!FSRCNNRenderer::init())
+        return false;
 
     return true;
 }
 
 void VideoRenderer::destroy()
 {
+    FSRCNNRenderer::destroy();
+
     if (g_tex_y) glDeleteTextures(1, &g_tex_y);
     if (g_tex_u) glDeleteTextures(1, &g_tex_u);
     if (g_tex_v) glDeleteTextures(1, &g_tex_v);
@@ -729,6 +844,7 @@ void VideoRenderer::destroy()
     if (g_tex_downscale) glDeleteTextures(1, &g_tex_downscale);
     if (g_tex_nis_coef_scale) glDeleteTextures(1, &g_tex_nis_coef_scale);
     if (g_tex_nis_coef_usm) glDeleteTextures(1, &g_tex_nis_coef_usm);
+    if (g_tex_font_atlas) glDeleteTextures(1, &g_tex_font_atlas);
     if (g_fbo_decode) gl::DeleteFramebuffers(1, &g_fbo_decode);
     if (g_fbo_upscale) gl::DeleteFramebuffers(1, &g_fbo_upscale);
     if (g_fbo_downscale) gl::DeleteFramebuffers(1, &g_fbo_downscale);
@@ -736,20 +852,29 @@ void VideoRenderer::destroy()
     if (g_vao_static) gl::DeleteVertexArrays(1, &g_vao_static);
     if (g_vbo_composite) gl::DeleteBuffers(1, &g_vbo_composite);
     if (g_vao_composite) gl::DeleteVertexArrays(1, &g_vao_composite);
+    if (g_vbo_text) gl::DeleteBuffers(1, &g_vbo_text);
+    if (g_vao_text) gl::DeleteVertexArrays(1, &g_vao_text);
+    if (g_vbo_box) gl::DeleteBuffers(1, &g_vbo_box);
+    if (g_vao_box) gl::DeleteVertexArrays(1, &g_vao_box);
     if (g_program_decode_yuv) gl::DeleteProgram(g_program_decode_yuv);
     if (g_program_decode_rgba) gl::DeleteProgram(g_program_decode_rgba);
     if (g_program_easu) gl::DeleteProgram(g_program_easu);
     if (g_program_rcas) gl::DeleteProgram(g_program_rcas);
     if (g_program_nis) gl::DeleteProgram(g_program_nis);
+    if (g_program_text) gl::DeleteProgram(g_program_text);
+    if (g_program_flat) gl::DeleteProgram(g_program_flat);
 
     g_tex_y = g_tex_u = g_tex_v = g_tex_rgba = 0;
     g_tex_decode = g_tex_upscale = g_tex_downscale = 0;
-    g_tex_nis_coef_scale = g_tex_nis_coef_usm = 0;
+    g_tex_nis_coef_scale = g_tex_nis_coef_usm = g_tex_font_atlas = 0;
     g_fbo_decode = g_fbo_upscale = g_fbo_downscale = 0;
     g_vbo_static = g_vao_static = g_vbo_composite = g_vao_composite = 0;
+    g_vbo_text = g_vao_text = g_vbo_box = g_vao_box = 0;
     g_program_decode_yuv = g_program_decode_rgba = g_program_easu = g_program_rcas = g_program_nis = 0;
+    g_program_text = g_program_flat = 0;
     g_y_w = g_y_h = g_uv_w = g_uv_h = g_rgba_w = g_rgba_h = 0;
     g_decode_w = g_decode_h = g_upscale_w = g_upscale_h = g_downscale_w = g_downscale_h = 0;
+    g_overlay_active = false;
 }
 
 bool VideoRenderer::ensure_yuv_textures(int width, int height)
@@ -1011,44 +1136,58 @@ void VideoRenderer::draw(const SDL_Rect &rect, int drawable_w, int drawable_h, b
             upscale_src_h = ds_h;
         }
 
-        gl::BindFramebuffer(GL_FRAMEBUFFER, g_fbo_upscale);
-        glViewport(0, 0, rect.w, rect.h);
-        gl::ActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, upscale_input_tex);
+        if (g_upscaler_mode == UpscalerMode::FSRCNN) {
+            // FSRCNN owns its own FBOs/textures at its own fixed-2x-scale
+            // resolution (not rect.w x rect.h) - the composite pass below
+            // samples whatever it returns via normalized UV regardless, the
+            // same way it already fits FSR1/NIS's rect-sized output, so no
+            // extra resize step is needed here.
+            int fsrcnn_out_w = 0, fsrcnn_out_h = 0;
+            GLuint fsrcnn_out = FSRCNNRenderer::run(upscale_input_tex, upscale_src_w, upscale_src_h, fsrcnn_out_w, fsrcnn_out_h);
+            if (!fsrcnn_out)
+                return;
+            composite_source = fsrcnn_out;
+            composite_sharpness = 100.0f; // FSRCNN is a trained SR net, not paired with a separate sharpen pass
+        } else {
+            gl::BindFramebuffer(GL_FRAMEBUFFER, g_fbo_upscale);
+            glViewport(0, 0, rect.w, rect.h);
+            gl::ActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, upscale_input_tex);
 
-        if (g_upscaler_mode == UpscalerMode::FSR1) {
-            gl::UseProgram(g_program_easu);
-            gl::Uniform1i(g_loc_easu_tex, 0);
-            gl::Uniform2f(g_loc_easu_src_size, (float)upscale_src_w, (float)upscale_src_h);
-            gl::Uniform2f(g_loc_easu_texel_size, 1.0f / upscale_src_w, 1.0f / upscale_src_h);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-            composite_source = g_tex_upscale;
-            composite_sharpness = g_sharpness;
-        } else { // NIS
-            NISTuning nt = compute_nis_tuning(g_nis_sharpness);
-            gl::UseProgram(g_program_nis);
-            gl::ActiveTexture(GL_TEXTURE1);
-            glBindTexture(GL_TEXTURE_2D, g_tex_nis_coef_scale);
-            gl::ActiveTexture(GL_TEXTURE2);
-            glBindTexture(GL_TEXTURE_2D, g_tex_nis_coef_usm);
-            gl::Uniform1i(g_loc_nis_tex, 0);
-            gl::Uniform1i(g_loc_nis_coef_scaler, 1);
-            gl::Uniform1i(g_loc_nis_coef_usm, 2);
-            gl::Uniform2f(g_loc_nis_src_size, (float)upscale_src_w, (float)upscale_src_h);
-            gl::Uniform2f(g_loc_nis_texel_size, 1.0f / upscale_src_w, 1.0f / upscale_src_h);
-            gl::Uniform1f(g_loc_nis_detect_ratio, nt.detectRatio);
-            gl::Uniform1f(g_loc_nis_detect_thres, nt.detectThres);
-            gl::Uniform1f(g_loc_nis_min_contrast_ratio, nt.minContrastRatio);
-            gl::Uniform1f(g_loc_nis_ratio_norm, nt.ratioNorm);
-            gl::Uniform1f(g_loc_nis_sharp_start_y, nt.sharpStartY);
-            gl::Uniform1f(g_loc_nis_sharp_scale_y, nt.sharpScaleY);
-            gl::Uniform1f(g_loc_nis_sharp_strength_min, nt.sharpStrengthMin);
-            gl::Uniform1f(g_loc_nis_sharp_strength_scale, nt.sharpStrengthScale);
-            gl::Uniform1f(g_loc_nis_sharp_limit_min, nt.sharpLimitMin);
-            gl::Uniform1f(g_loc_nis_sharp_limit_scale, nt.sharpLimitScale);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-            composite_source = g_tex_upscale;
-            composite_sharpness = 100.0f; // NIS bakes its own USM sharpen in; RCAS stays a passthrough
+            if (g_upscaler_mode == UpscalerMode::FSR1) {
+                gl::UseProgram(g_program_easu);
+                gl::Uniform1i(g_loc_easu_tex, 0);
+                gl::Uniform2f(g_loc_easu_src_size, (float)upscale_src_w, (float)upscale_src_h);
+                gl::Uniform2f(g_loc_easu_texel_size, 1.0f / upscale_src_w, 1.0f / upscale_src_h);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                composite_source = g_tex_upscale;
+                composite_sharpness = g_sharpness;
+            } else { // NIS
+                NISTuning nt = compute_nis_tuning(g_nis_sharpness);
+                gl::UseProgram(g_program_nis);
+                gl::ActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, g_tex_nis_coef_scale);
+                gl::ActiveTexture(GL_TEXTURE2);
+                glBindTexture(GL_TEXTURE_2D, g_tex_nis_coef_usm);
+                gl::Uniform1i(g_loc_nis_tex, 0);
+                gl::Uniform1i(g_loc_nis_coef_scaler, 1);
+                gl::Uniform1i(g_loc_nis_coef_usm, 2);
+                gl::Uniform2f(g_loc_nis_src_size, (float)upscale_src_w, (float)upscale_src_h);
+                gl::Uniform2f(g_loc_nis_texel_size, 1.0f / upscale_src_w, 1.0f / upscale_src_h);
+                gl::Uniform1f(g_loc_nis_detect_ratio, nt.detectRatio);
+                gl::Uniform1f(g_loc_nis_detect_thres, nt.detectThres);
+                gl::Uniform1f(g_loc_nis_min_contrast_ratio, nt.minContrastRatio);
+                gl::Uniform1f(g_loc_nis_ratio_norm, nt.ratioNorm);
+                gl::Uniform1f(g_loc_nis_sharp_start_y, nt.sharpStartY);
+                gl::Uniform1f(g_loc_nis_sharp_scale_y, nt.sharpScaleY);
+                gl::Uniform1f(g_loc_nis_sharp_strength_min, nt.sharpStrengthMin);
+                gl::Uniform1f(g_loc_nis_sharp_strength_scale, nt.sharpStrengthScale);
+                gl::Uniform1f(g_loc_nis_sharp_limit_min, nt.sharpLimitMin);
+                gl::Uniform1f(g_loc_nis_sharp_limit_scale, nt.sharpLimitScale);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                composite_source = g_tex_upscale;
+                composite_sharpness = 100.0f; // NIS bakes its own USM sharpen in; RCAS stays a passthrough
+            }
         }
     }
 
@@ -1066,6 +1205,8 @@ void VideoRenderer::draw(const SDL_Rect &rect, int drawable_w, int drawable_h, b
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     gl::BindVertexArray(0);
 
+    draw_overlay(drawable_w, drawable_h);
+
     GLenum err;
     while ((err = glGetError()) != GL_NO_ERROR)
         Log::error() << "GL error 0x" << std::hex << err << std::dec << " during VideoRenderer::draw().";
@@ -1079,9 +1220,134 @@ void VideoRenderer::set_sharpness(float sharpness)
     g_sharpness = sharpness < 0.0f ? 0.0f : sharpness;
 }
 
+void VideoRenderer::show_overlay(const std::string &text)
+{
+    int drawable_w = 0, drawable_h = 0;
+    SDL_GL_GetDrawableSize(window, &drawable_w, &drawable_h);
+    if (drawable_w <= 0 || drawable_h <= 0)
+        return;
+
+    int count = (int)text.size();
+    if (count > kMaxOverlayChars)
+        count = kMaxOverlayChars;
+
+    if (count > 0) {
+        std::vector<float> verts;
+        verts.reserve(count * 6 * 4);
+
+        int textX0 = kOverlayMarginPx + kOverlayPaddingPx;
+        int textY0 = kOverlayMarginPx + kOverlayPaddingPx;
+
+        for (int i = 0; i < count; i++) {
+            unsigned char c = (unsigned char)text[i];
+            int glyph = (c < 128) ? c : 32; // anything outside ASCII falls back to space
+            int col = glyph % kFontCols;
+            int row = glyph / kFontCols;
+            float u0 = (float)col / kFontCols;
+            float v0 = (float)row / kFontRows;
+            float u1 = (float)(col + 1) / kFontCols;
+            float v1 = (float)(row + 1) / kFontRows;
+
+            float px0 = (float)(textX0 + i * kGlyphCell);
+            float py0 = (float)textY0;
+            float px1 = px0 + kGlyphCell;
+            float py1 = py0 + kGlyphCell;
+
+            // Direct-to-screen quad (not rendered into an FBO for later
+            // resampling), so this is the plain top->NDC+1 mapping - no
+            // v-flip needed, unlike the video decode/upscale passes.
+            float x0 = (px0 / drawable_w) * 2.0f - 1.0f;
+            float x1 = (px1 / drawable_w) * 2.0f - 1.0f;
+            float y0 = 1.0f - (py0 / drawable_h) * 2.0f;
+            float y1 = 1.0f - (py1 / drawable_h) * 2.0f;
+
+            float quad[24] = {
+                x0, y0, u0, v0,
+                x1, y0, u1, v0,
+                x0, y1, u0, v1,
+
+                x1, y0, u1, v0,
+                x1, y1, u1, v1,
+                x0, y1, u0, v1,
+            };
+            verts.insert(verts.end(), quad, quad + 24);
+        }
+
+        gl::BindBuffer(GL_ARRAY_BUFFER, g_vbo_text);
+        gl::BufferSubData(GL_ARRAY_BUFFER, 0, verts.size() * sizeof(float), verts.data());
+    }
+
+    g_overlay_char_count = count;
+    g_overlay_box_w = kOverlayPaddingPx * 2 + count * kGlyphCell;
+    g_overlay_box_h = kOverlayPaddingPx * 2 + kGlyphCell;
+    g_overlay_start_us = av_gettime_relative();
+    g_overlay_active = count > 0;
+}
+
+void VideoRenderer::draw_overlay(int drawable_w, int drawable_h)
+{
+    if (!g_overlay_active)
+        return;
+
+    double elapsed = (av_gettime_relative() - g_overlay_start_us) / 1000000.0;
+    if (elapsed >= kOverlayHoldSeconds + kOverlayFadeSeconds) {
+        g_overlay_active = false;
+        return;
+    }
+
+    float alpha = 1.0f;
+    if (elapsed > kOverlayHoldSeconds)
+        alpha = 1.0f - (float)((elapsed - kOverlayHoldSeconds) / kOverlayFadeSeconds);
+    alpha = alpha < 0.0f ? 0.0f : (alpha > 1.0f ? 1.0f : alpha);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // Background box, for legibility over arbitrary video content.
+    {
+        float bx0 = (float)kOverlayMarginPx;
+        float by0 = (float)kOverlayMarginPx;
+        float bx1 = bx0 + g_overlay_box_w;
+        float by1 = by0 + g_overlay_box_h;
+
+        float x0 = (bx0 / drawable_w) * 2.0f - 1.0f;
+        float x1 = (bx1 / drawable_w) * 2.0f - 1.0f;
+        float y0 = 1.0f - (by0 / drawable_h) * 2.0f;
+        float y1 = 1.0f - (by1 / drawable_h) * 2.0f;
+
+        float verts[16] = {
+            x0, y0, 0.0f, 0.0f,
+            x1, y0, 1.0f, 0.0f,
+            x0, y1, 0.0f, 1.0f,
+            x1, y1, 1.0f, 1.0f,
+        };
+        gl::BindBuffer(GL_ARRAY_BUFFER, g_vbo_box);
+        gl::BufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+
+        gl::UseProgram(g_program_flat);
+        gl::Uniform4f(g_loc_flat_color, 0.0f, 0.0f, 0.0f, 0.55f * alpha);
+        gl::BindVertexArray(g_vao_box);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+
+    if (g_overlay_char_count > 0) {
+        gl::UseProgram(g_program_text);
+        gl::ActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_tex_font_atlas);
+        gl::Uniform1i(g_loc_text_atlas, 0);
+        gl::Uniform3f(g_loc_text_color, 1.0f, 1.0f, 1.0f);
+        gl::Uniform1f(g_loc_text_alpha, alpha);
+        gl::BindVertexArray(g_vao_text);
+        glDrawArrays(GL_TRIANGLES, 0, g_overlay_char_count * 6);
+    }
+
+    gl::BindVertexArray(0);
+    glDisable(GL_BLEND);
+}
+
 void VideoRenderer::cycle_upscaler()
 {
-    g_upscaler_mode = static_cast<UpscalerMode>((static_cast<int>(g_upscaler_mode) + 1) % 3);
+    g_upscaler_mode = static_cast<UpscalerMode>((static_cast<int>(g_upscaler_mode) + 1) % kUpscalerModeCount);
 }
 
 const char *VideoRenderer::upscaler_name()

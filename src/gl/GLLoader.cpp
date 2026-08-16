@@ -19,8 +19,11 @@ PFNGLDELETEPROGRAMPROC DeleteProgram = nullptr;
 PFNGLUSEPROGRAMPROC UseProgram = nullptr;
 PFNGLGETUNIFORMLOCATIONPROC GetUniformLocation = nullptr;
 PFNGLUNIFORM1IPROC Uniform1i = nullptr;
+PFNGLUNIFORM2IPROC Uniform2i = nullptr;
 PFNGLUNIFORM1FPROC Uniform1f = nullptr;
 PFNGLUNIFORM2FPROC Uniform2f = nullptr;
+PFNGLUNIFORM3FPROC Uniform3f = nullptr;
+PFNGLUNIFORM4FPROC Uniform4f = nullptr;
 
 PFNGLGENVERTEXARRAYSPROC GenVertexArrays = nullptr;
 PFNGLBINDVERTEXARRAYPROC BindVertexArray = nullptr;
@@ -72,8 +75,11 @@ bool load()
     ok &= load_proc(UseProgram, "glUseProgram");
     ok &= load_proc(GetUniformLocation, "glGetUniformLocation");
     ok &= load_proc(Uniform1i, "glUniform1i");
+    ok &= load_proc(Uniform2i, "glUniform2i");
     ok &= load_proc(Uniform1f, "glUniform1f");
     ok &= load_proc(Uniform2f, "glUniform2f");
+    ok &= load_proc(Uniform3f, "glUniform3f");
+    ok &= load_proc(Uniform4f, "glUniform4f");
 
     ok &= load_proc(GenVertexArrays, "glGenVertexArrays");
     ok &= load_proc(BindVertexArray, "glBindVertexArray");
