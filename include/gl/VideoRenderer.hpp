@@ -5,12 +5,16 @@
 
 // Owns every GL object used to turn decoded video frames into upscaled
 // pixels on screen. Three passes per frame:
-//   A. decode:  YUV420P (or sws_scale-converted BGRA) source -> RGB, into an
-//               FBO texture at the source frame's native resolution.
-//   B. easu:    edge-adaptive upscale of that texture into an FBO texture
-//               sized to the destination (letterboxed) rect.
-//   C. rcas:    contrast-adaptive sharpen of the upscaled texture, drawn
-//               straight to the backbuffer at the destination rect.
+//   A. decode:   YUV420P (or sws_scale-converted BGRA) source -> RGB, into an
+//                FBO texture at the source frame's native resolution.
+//   B. upscale:  the active upscaler (FSR1 EASU, or NIS - see
+//                cycle_upscaler()) into an FBO texture sized to the
+//                destination (letterboxed) rect. Skipped entirely in
+//                Bilinear mode.
+//   C. composite: FSR1's RCAS sharpen (or, for NIS/Bilinear, a forced
+//                passthrough reusing the same RCAS program - NIS already
+//                bakes its own sharpen in), drawn straight to the backbuffer
+//                at the destination rect.
 // One video output per process, so (like `window`/`renderer` used to be)
 // this is deliberately a set of static globals rather than an instance.
 class VideoRenderer
@@ -25,33 +29,35 @@ class VideoRenderer
         // sws_scale first for any pixel format that isn't planar YUV420P.
         static bool upload_frame(AVFrame *frame, struct SwsContext **img_convert_ctx);
 
-        // Runs the decode -> EASU -> RCAS pipeline for the most recently
-        // uploaded frame, landing the final sharpened image in `rect`
-        // within a `drawable_w`x`drawable_h` viewport. `flip_v` mirrors the
+        // Runs the decode -> upscale -> composite pipeline for the most
+        // recently uploaded frame, landing the final image in `rect` within
+        // a `drawable_w`x`drawable_h` viewport. `flip_v` mirrors the
         // vertical flip SDL_RenderCopyEx used to apply for bottom-up frames.
         static void draw(const SDL_Rect &rect, int drawable_w, int drawable_h, bool flip_v);
 
         static void clear();
         static void present();
 
-        // FSR RCAS sharpening strength in AMD's own "stops" convention
+        // FSR1 RCAS sharpening strength in AMD's own "stops" convention
         // (FsrRcasCon): 0.0 = maximum sharpness, each +1.0 halves it
-        // (internally, lobe *= exp2(-sharpness)).
+        // (internally, lobe *= exp2(-sharpness)). Only applies in FSR1 mode.
         static void set_sharpness(float sharpness);
 
-        // Toggles the EASU+RCAS passes on/off for A/B comparison. When off,
-        // `draw()` falls back to a plain GL_LINEAR stretch of the decoded
-        // frame into `rect` - the same quality the old SDL_Renderer path had.
-        static void toggle_fsr();
-        static bool fsr_enabled();
+        // Cycles the active upscaler: Bilinear (off - plain GL_LINEAR
+        // stretch, the same quality the old SDL_Renderer path had) -> FSR1
+        // (EASU+RCAS) -> NIS -> back to Bilinear. Use for A/B comparison.
+        static void cycle_upscaler();
+        static const char *upscaler_name();
 
         // Cycles through AMD's published FSR1 quality presets (Native,
         // Ultra Quality 1.3x, Quality 1.5x, Balanced 1.7x, Performance 2.0x).
-        // These control how much resolution EASU is asked to reconstruct:
-        // the decoded frame is downsampled by the preset's ratio before
-        // EASU upscales it back to display size, same as choosing a quality
-        // mode in a game's FSR setting. Only affects anything while FSR is
-        // enabled - see toggle_fsr().
+        // These control how much resolution the upscaler is asked to
+        // reconstruct: the decoded frame is downsampled by the preset's
+        // ratio before upscaling it back to display size, same as choosing
+        // a quality mode in a game's FSR/NIS setting. Only affects anything
+        // while an upscaler is active - see cycle_upscaler(). Note NIS's own
+        // reference implementation only validates up to 2x per axis
+        // (Performance); FSR1 documents no such limit.
         static void cycle_render_scale();
         static const char *render_scale_name();
 

@@ -3,6 +3,26 @@ Lightweight media player written in C++ using FFmpeg and SDL2. Currently in deve
 
 [![CodeQL](https://github.com/ArrowInteractive/liquid/actions/workflows/codeql-analysis.yml/badge.svg)](https://github.com/ArrowInteractive/liquid/actions/workflows/codeql-analysis.yml)
 
+# Upscaling
+
+Liquid renders video through a custom OpenGL pipeline (decode -> upscale -> sharpen) instead of relying on a plain bilinear stretch, and can upscale in real time using either of two spatial upscaling algorithms, faithfully ported from their official reference implementations:
+
+- **AMD FidelityFX Super Resolution 1 (FSR1)** - the EASU edge-adaptive upscale pass followed by the RCAS contrast-adaptive sharpen pass, ported from AMD's MIT-licensed [`ffx_fsr1.h`](https://github.com/GPUOpen-Effects/FidelityFX-FSR).
+- **NVIDIA Image Scaling (NIS)** - NVScaler's directional-filter upscale with its built-in adaptive sharpening, ported from NVIDIA's MIT-licensed [`NIS_Scaler.h`](https://github.com/NVIDIAGameWorks/NVIDIAImageScaling).
+
+Both run as plain OpenGL 3.3 core fragment shaders (no compute shaders, so they also work on macOS, which never got OpenGL compute support), and neither depends on the vendor its name suggests - "FSR" and "NIS" run identically on any GPU, AMD, NVIDIA, Intel, or otherwise.
+
+### Controls
+
+| Key | Action |
+| --- | --- |
+| `U` | Cycle the active upscaler: Bilinear (off) -> FSR1 (EASU + RCAS) -> NIS -> back to Bilinear |
+| `R` | Cycle the render-scale quality preset: Native -> Ultra Quality (1.3x) -> Quality (1.5x) -> Balanced (1.7x) -> Performance (2.0x) |
+
+The render-scale preset controls how much resolution is deliberately thrown away *before* the upscaler runs, then reconstructed back up to display size - the same tradeoff as picking a quality mode in a game's FSR/NIS setting, useful for judging how much detail an upscaler can actually recover at a given ratio. Native (the default) skips this and feeds the upscaler the full decoded frame.
+
+Switching upscalers or presets logs the new state to the console, so it's easy to A/B compare - e.g. pause on a detailed frame and press `U` to flip between algorithms without losing your place.
+
 # Build Guide
 
 ## Linux 

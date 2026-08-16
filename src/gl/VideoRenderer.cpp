@@ -1,5 +1,6 @@
 #include "gl/VideoRenderer.hpp"
 #include "gl/Shader.hpp"
+#include "gl/NISCoefficients.hpp"
 #include "utils/Log.hpp"
 #include <ios>
 #include <vector>
@@ -242,16 +243,273 @@ const char *fragment_src_rcas =
     "    FragColor = vec4(clamp(result, 0.0, 1.0), 1.0);\n"
     "}\n";
 
+// Faithful port of NVIDIA Image Scaling's NVScaler (NIS_Scaler.h, MIT
+// licensed: https://github.com/NVIDIAGameWorks/NVIDIAImageScaling). Their
+// reference is written as a compute shader that caches a luma tile and a
+// derived edge map in shared memory across a whole thread-group, since
+// that's a real perf win at 4K/60. We don't have compute shaders (GL 3.3
+// core, for macOS compatibility - same reasoning as EASU), and at video
+// resolutions the redundant work is cheap anyway, so every fragment just
+// independently re-fetches and re-derives its own local edge map / 6x6 luma
+// window straight from the source texture. The filter math itself (edge
+// detection, the coefficient-LUT-driven 6-tap normal + 4 directional
+// filters, the LTI ringing guard, the luma-only USM sharpen) is unchanged.
+// GLSL 330 has no 2D arrays, so the reference's p[6][6] window is a flat
+// float[36] indexed as p[i*6+j] throughout.
+const char *fragment_src_nis =
+    "#version 330 core\n"
+    "in vec2 vTexCoord;\n"
+    "out vec4 FragColor;\n"
+    "uniform sampler2D uTex;\n"
+    "uniform sampler2D uCoefScaler;\n"
+    "uniform sampler2D uCoefUSM;\n"
+    "uniform vec2 uSrcSize;\n"
+    "uniform vec2 uSrcTexelSize;\n"
+    "uniform float uDetectRatio;\n"
+    "uniform float uDetectThres;\n"
+    "uniform float uMinContrastRatio;\n"
+    "uniform float uRatioNorm;\n"
+    "uniform float uSharpStartY;\n"
+    "uniform float uSharpScaleY;\n"
+    "uniform float uSharpStrengthMin;\n"
+    "uniform float uSharpStrengthScale;\n"
+    "uniform float uSharpLimitMin;\n"
+    "uniform float uSharpLimitScale;\n"
+    "const float kContrastBoost = 1.0;\n"
+    "const float kEps = 1.0 / 255.0;\n"
+    "const int kPhaseCount = 64;\n"
+    "\n"
+    "float getY(vec3 rgb) { return 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b; }\n"
+    "\n"
+    "float lumaAt(vec2 texel) {\n"
+    "    return getY(texture(uTex, (texel + 0.5) * uSrcTexelSize).rgb);\n"
+    "}\n"
+    "\n"
+    // Edge weights (0/90/45/135 deg) centered at integer texel `c`, from its
+    // own 3x3 luma neighborhood - this is GetEdgeMap() evaluated at a single
+    // fixed offset, since every call site in the original only ever needed
+    // one specific 3x3 window per invocation once the tile-relative indices
+    // are resolved back to world texel coordinates.
+    "vec4 edgeMapAt(vec2 c) {\n"
+    "    float p00 = lumaAt(c + vec2(-1.0, -1.0));\n"
+    "    float p01 = lumaAt(c + vec2( 0.0, -1.0));\n"
+    "    float p02 = lumaAt(c + vec2( 1.0, -1.0));\n"
+    "    float p10 = lumaAt(c + vec2(-1.0,  0.0));\n"
+    "    float p12 = lumaAt(c + vec2( 1.0,  0.0));\n"
+    "    float p20 = lumaAt(c + vec2(-1.0,  1.0));\n"
+    "    float p21 = lumaAt(c + vec2( 0.0,  1.0));\n"
+    "    float p22 = lumaAt(c + vec2( 1.0,  1.0));\n"
+    "\n"
+    "    float g0 = abs(p00 + p01 + p02 - p20 - p21 - p22);\n"
+    "    float g45 = abs(p10 + p00 + p01 - p21 - p22 - p12);\n"
+    "    float g90 = abs(p00 + p10 + p20 - p02 - p12 - p22);\n"
+    "    float g135 = abs(p10 + p20 + p21 - p01 - p02 - p12);\n"
+    "\n"
+    "    float g0_90_max = max(g0, g90);\n"
+    "    float g0_90_min = min(g0, g90);\n"
+    "    float g45_135_max = max(g45, g135);\n"
+    "    float g45_135_min = min(g45, g135);\n"
+    "\n"
+    "    if (g0_90_max + g45_135_max == 0.0)\n"
+    "        return vec4(0.0);\n"
+    "\n"
+    "    float e_0_90 = min(g0_90_max / (g0_90_max + g45_135_max), 1.0);\n"
+    "    float e_45_135 = 1.0 - e_0_90;\n"
+    "\n"
+    "    bool c_0_90 = (g0_90_max > g0_90_min * uDetectRatio) && (g0_90_max > uDetectThres) && (g0_90_max > g45_135_min);\n"
+    "    bool c_45_135 = (g45_135_max > g45_135_min * uDetectRatio) && (g45_135_max > uDetectThres) && (g45_135_max > g0_90_min);\n"
+    "    bool c_g_0_90 = (g0_90_max == g0);\n"
+    "    bool c_g_45_135 = (g45_135_max == g45);\n"
+    "\n"
+    "    float f_e_0_90 = (c_0_90 && c_45_135) ? e_0_90 : 1.0;\n"
+    "    float f_e_45_135 = (c_0_90 && c_45_135) ? e_45_135 : 1.0;\n"
+    "\n"
+    "    float w0 = (c_0_90 && c_g_0_90) ? f_e_0_90 : 0.0;\n"
+    "    float w90 = (c_0_90 && !c_g_0_90) ? f_e_0_90 : 0.0;\n"
+    "    float w45 = (c_45_135 && c_g_45_135) ? f_e_45_135 : 0.0;\n"
+    "    float w135 = (c_45_135 && !c_g_45_135) ? f_e_45_135 : 0.0;\n"
+    "\n"
+    "    return vec4(w0, w90, w45, w135);\n"
+    "}\n"
+    "\n"
+    "float calcLTI(float p0, float p1, float p2, float p3, float p4, float p5, int phaseIndex) {\n"
+    "    bool selector = (phaseIndex <= kPhaseCount / 2);\n"
+    "    float sel = selector ? p0 : p3;\n"
+    "    float aMin = min(min(p1, p2), sel);\n"
+    "    float aMax = max(max(p1, p2), sel);\n"
+    "    sel = selector ? p2 : p5;\n"
+    "    float bMin = min(min(p3, p4), sel);\n"
+    "    float bMax = max(max(p3, p4), sel);\n"
+    "\n"
+    "    float aCont = aMax - aMin;\n"
+    "    float bCont = bMax - bMin;\n"
+    "\n"
+    "    float contRatio = max(aCont, bCont) / (min(aCont, bCont) + kEps);\n"
+    "    return (1.0 - clamp((contRatio - uMinContrastRatio) * uRatioNorm, 0.0, 1.0)) * kContrastBoost;\n"
+    "}\n"
+    "\n"
+    "float evalPoly6(float pxl[6], int phaseInt) {\n"
+    "    vec4 lo = texelFetch(uCoefScaler, ivec2(0, phaseInt), 0);\n"
+    "    vec4 hi = texelFetch(uCoefScaler, ivec2(1, phaseInt), 0);\n"
+    "    float y = pxl[0]*lo.x + pxl[1]*lo.y + pxl[2]*lo.z + pxl[3]*lo.w + pxl[4]*hi.x + pxl[5]*hi.y;\n"
+    "\n"
+    "    vec4 uLo = texelFetch(uCoefUSM, ivec2(0, phaseInt), 0);\n"
+    "    vec4 uHi = texelFetch(uCoefUSM, ivec2(1, phaseInt), 0);\n"
+    "    float yUsm = pxl[0]*uLo.x + pxl[1]*uLo.y + pxl[2]*uLo.z + pxl[3]*uLo.w + pxl[4]*uHi.x + pxl[5]*uHi.y;\n"
+    "\n"
+    "    float yScale = 1.0 - clamp((y - uSharpStartY) * uSharpScaleY, 0.0, 1.0);\n"
+    "    float ySharpness = yScale * uSharpStrengthScale + uSharpStrengthMin;\n"
+    "    yUsm *= ySharpness;\n"
+    "\n"
+    "    float ySharpnessLimit = (yScale * uSharpLimitScale + uSharpLimitMin) * y;\n"
+    "    yUsm = min(ySharpnessLimit, max(-ySharpnessLimit, yUsm));\n"
+    "    yUsm *= calcLTI(pxl[0], pxl[1], pxl[2], pxl[3], pxl[4], pxl[5], phaseInt);\n"
+    "\n"
+    "    return y + yUsm;\n"
+    "}\n"
+    "\n"
+    "float filterNormal(float p[36], int phaseXInt, int phaseYInt) {\n"
+    "    vec4 loY = texelFetch(uCoefScaler, ivec2(0, phaseYInt), 0);\n"
+    "    vec4 hiY = texelFetch(uCoefScaler, ivec2(1, phaseYInt), 0);\n"
+    "    float cY[6] = float[6](loY.x, loY.y, loY.z, loY.w, hiY.x, hiY.y);\n"
+    "\n"
+    "    vec4 loX = texelFetch(uCoefScaler, ivec2(0, phaseXInt), 0);\n"
+    "    vec4 hiX = texelFetch(uCoefScaler, ivec2(1, phaseXInt), 0);\n"
+    "    float cX[6] = float[6](loX.x, loX.y, loX.z, loX.w, hiX.x, hiX.y);\n"
+    "\n"
+    "    float hAcc = 0.0;\n"
+    "    for (int j = 0; j < 6; j++) {\n"
+    "        float vAcc = 0.0;\n"
+    "        for (int i = 0; i < 6; i++)\n"
+    "            vAcc += p[i*6+j] * cY[i];\n"
+    "        hAcc += vAcc * cX[j];\n"
+    "    }\n"
+    "    return hAcc;\n"
+    "}\n"
+    "\n"
+    "float addDirFilters(float p[36], float phaseXFrac, float phaseYFrac, int phaseXInt, int phaseYInt, vec4 w) {\n"
+    "    float f = 0.0;\n"
+    "    if (w.x > 0.0) {\n"
+    "        float interp0Deg[6];\n"
+    "        for (int i = 0; i < 6; i++)\n"
+    "            interp0Deg[i] = mix(p[i*6+2], p[i*6+3], phaseXFrac);\n"
+    "        f += evalPoly6(interp0Deg, phaseYInt) * w.x;\n"
+    "    }\n"
+    "    if (w.y > 0.0) {\n"
+    "        float interp90Deg[6];\n"
+    "        for (int i = 0; i < 6; i++)\n"
+    "            interp90Deg[i] = mix(p[2*6+i], p[3*6+i], phaseYFrac);\n"
+    "        f += evalPoly6(interp90Deg, phaseXInt) * w.y;\n"
+    "    }\n"
+    "    if (w.z > 0.0) {\n"
+    "        float pphaseB45 = 0.5 + 0.5 * (phaseXFrac - phaseYFrac);\n"
+    "        float tempInterp45Deg[7];\n"
+    "        tempInterp45Deg[1] = mix(p[2*6+1], p[1*6+2], pphaseB45);\n"
+    "        tempInterp45Deg[3] = mix(p[3*6+2], p[2*6+3], pphaseB45);\n"
+    "        tempInterp45Deg[5] = mix(p[4*6+3], p[3*6+4], pphaseB45);\n"
+    "        {\n"
+    "            float pb = pphaseB45 - 0.5;\n"
+    "            float a = (pb >= 0.0) ? p[0*6+2] : p[2*6+0];\n"
+    "            float b = (pb >= 0.0) ? p[1*6+3] : p[3*6+1];\n"
+    "            float c = (pb >= 0.0) ? p[2*6+4] : p[4*6+2];\n"
+    "            float d = (pb >= 0.0) ? p[3*6+5] : p[5*6+3];\n"
+    "            tempInterp45Deg[0] = mix(p[1*6+1], a, abs(pb));\n"
+    "            tempInterp45Deg[2] = mix(p[2*6+2], b, abs(pb));\n"
+    "            tempInterp45Deg[4] = mix(p[3*6+3], c, abs(pb));\n"
+    "            tempInterp45Deg[6] = mix(p[4*6+4], d, abs(pb));\n"
+    "        }\n"
+    "        float interp45Deg[6];\n"
+    "        float pphaseP45 = phaseXFrac + phaseYFrac;\n"
+    "        if (pphaseP45 >= 1.0) {\n"
+    "            for (int i = 0; i < 6; i++)\n"
+    "                interp45Deg[i] = tempInterp45Deg[i+1];\n"
+    "            pphaseP45 -= 1.0;\n"
+    "        } else {\n"
+    "            for (int i = 0; i < 6; i++)\n"
+    "                interp45Deg[i] = tempInterp45Deg[i];\n"
+    "        }\n"
+    "        f += evalPoly6(interp45Deg, int(pphaseP45 * 64.0)) * w.z;\n"
+    "    }\n"
+    "    if (w.w > 0.0) {\n"
+    "        float pphaseB135 = 0.5 * (phaseXFrac + phaseYFrac);\n"
+    "        float tempInterp135Deg[7];\n"
+    "        tempInterp135Deg[1] = mix(p[3*6+1], p[4*6+2], pphaseB135);\n"
+    "        tempInterp135Deg[3] = mix(p[2*6+2], p[3*6+3], pphaseB135);\n"
+    "        tempInterp135Deg[5] = mix(p[1*6+3], p[2*6+4], pphaseB135);\n"
+    "        {\n"
+    "            float pb = pphaseB135 - 0.5;\n"
+    "            float a = (pb >= 0.0) ? p[5*6+2] : p[3*6+0];\n"
+    "            float b = (pb >= 0.0) ? p[4*6+3] : p[2*6+1];\n"
+    "            float c = (pb >= 0.0) ? p[3*6+4] : p[1*6+2];\n"
+    "            float d = (pb >= 0.0) ? p[2*6+5] : p[0*6+3];\n"
+    "            tempInterp135Deg[0] = mix(p[4*6+1], a, abs(pb));\n"
+    "            tempInterp135Deg[2] = mix(p[3*6+2], b, abs(pb));\n"
+    "            tempInterp135Deg[4] = mix(p[2*6+3], c, abs(pb));\n"
+    "            tempInterp135Deg[6] = mix(p[1*6+4], d, abs(pb));\n"
+    "        }\n"
+    "        float interp135Deg[6];\n"
+    "        float pphaseP135 = 1.0 + (phaseXFrac - phaseYFrac);\n"
+    "        if (pphaseP135 >= 1.0) {\n"
+    "            for (int i = 0; i < 6; i++)\n"
+    "                interp135Deg[i] = tempInterp135Deg[i+1];\n"
+    "            pphaseP135 -= 1.0;\n"
+    "        } else {\n"
+    "            for (int i = 0; i < 6; i++)\n"
+    "                interp135Deg[i] = tempInterp135Deg[i];\n"
+    "        }\n"
+    "        f += evalPoly6(interp135Deg, int(pphaseP135 * 64.0)) * w.w;\n"
+    "    }\n"
+    "    return f;\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    vec2 srcPos = vTexCoord * uSrcSize - 0.5;\n"
+    "    vec2 ip = floor(srcPos);\n"
+    "    vec2 frac = srcPos - ip;\n"
+    "    ivec2 phaseInt = ivec2(frac * 64.0);\n"
+    "\n"
+    "    vec4 edge00 = edgeMapAt(ip);\n"
+    "    vec4 edge01 = edgeMapAt(ip + vec2(1.0, 0.0));\n"
+    "    vec4 edge10 = edgeMapAt(ip + vec2(0.0, 1.0));\n"
+    "    vec4 edge11 = edgeMapAt(ip + vec2(1.0, 1.0));\n"
+    "    vec4 h0 = mix(edge00, edge01, frac.x);\n"
+    "    vec4 h1 = mix(edge10, edge11, frac.x);\n"
+    "    vec4 w = mix(h0, h1, frac.y);\n"
+    "\n"
+    "    float p[36];\n"
+    "    for (int i = 0; i < 6; i++)\n"
+    "        for (int j = 0; j < 6; j++)\n"
+    "            p[i*6+j] = lumaAt(ip + vec2(float(j - 2), float(i - 2)));\n"
+    "\n"
+    "    float baseWeight = 1.0 - w.x - w.y - w.z - w.w;\n"
+    "    float opY = filterNormal(p, phaseInt.x, phaseInt.y) * baseWeight;\n"
+    "    opY += addDirFilters(p, frac.x, frac.y, phaseInt.x, phaseInt.y, w);\n"
+    "\n"
+    "    vec4 op = texture(uTex, vTexCoord);\n"
+    "    float y = getY(op.rgb);\n"
+    "    float corr = opY - y;\n"
+    "    op.rgb += corr;\n"
+    "\n"
+    "    FragColor = vec4(clamp(op.rgb, 0.0, 1.0), 1.0);\n"
+    "}\n";
+
 GLuint g_program_decode_yuv = 0;
 GLuint g_program_decode_rgba = 0;
 GLuint g_program_easu = 0;
 GLuint g_program_rcas = 0;
+GLuint g_program_nis = 0;
 
 GLint g_loc_decode_yuv_tex_y = -1, g_loc_decode_yuv_tex_u = -1, g_loc_decode_yuv_tex_v = -1;
 GLint g_loc_decode_yuv_mode = -1, g_loc_decode_yuv_flip = -1;
 GLint g_loc_decode_rgba_tex = -1, g_loc_decode_rgba_flip = -1;
 GLint g_loc_easu_tex = -1, g_loc_easu_src_size = -1, g_loc_easu_texel_size = -1;
 GLint g_loc_rcas_tex = -1, g_loc_rcas_texel_size = -1, g_loc_rcas_sharpness = -1;
+GLint g_loc_nis_tex = -1, g_loc_nis_coef_scaler = -1, g_loc_nis_coef_usm = -1;
+GLint g_loc_nis_src_size = -1, g_loc_nis_texel_size = -1;
+GLint g_loc_nis_detect_ratio = -1, g_loc_nis_detect_thres = -1, g_loc_nis_min_contrast_ratio = -1, g_loc_nis_ratio_norm = -1;
+GLint g_loc_nis_sharp_start_y = -1, g_loc_nis_sharp_scale_y = -1;
+GLint g_loc_nis_sharp_strength_min = -1, g_loc_nis_sharp_strength_scale = -1;
+GLint g_loc_nis_sharp_limit_min = -1, g_loc_nis_sharp_limit_scale = -1;
 
 GLuint g_vao_static = 0, g_vbo_static = 0;   // fixed fullscreen quad: decode + EASU passes
 GLuint g_vao_composite = 0, g_vbo_composite = 0; // positioned into `rect`: final RCAS pass
@@ -275,8 +533,14 @@ int g_upscale_w = 0, g_upscale_h = 0;
 GLuint g_fbo_downscale = 0, g_tex_downscale = 0;
 int g_downscale_w = 0, g_downscale_h = 0;
 
+GLuint g_tex_nis_coef_scale = 0, g_tex_nis_coef_usm = 0;
+
 float g_sharpness = 0.2f; // AMD's "stops" convention: 0.0 = max sharpness
-bool g_fsr_enabled = true;
+float g_nis_sharpness = 0.5f; // NIS's own [0,1] convention: 0.5 is its documented neutral default
+
+enum class UpscalerMode { Bilinear, FSR1, NIS };
+const char *kUpscalerNames[] = { "Bilinear (off)", "FSR1 (EASU+RCAS)", "NIS" };
+UpscalerMode g_upscaler_mode = UpscalerMode::FSR1;
 
 // AMD's published FSR1 quality presets: the per-dimension ratio between the
 // image EASU actually upscales from and the final display size. "Native"
@@ -307,6 +571,46 @@ GLuint make_clamped_linear_texture()
     return tex;
 }
 
+// Faithful port of NIS_Config.h's NVScalerUpdateConfig() tuning-constant
+// derivation (SDR/None HDR mode branch only - we don't support HDR). Cheap
+// enough to just recompute from the current sharpness slider every frame
+// rather than caching.
+struct NISTuning {
+    float detectRatio, detectThres, minContrastRatio, ratioNorm;
+    float sharpStartY, sharpScaleY;
+    float sharpStrengthMin, sharpStrengthScale;
+    float sharpLimitMin, sharpLimitScale;
+};
+
+NISTuning compute_nis_tuning(float sharpness)
+{
+    sharpness = sharpness < 0.0f ? 0.0f : (sharpness > 1.0f ? 1.0f : sharpness);
+    float sharpen_slider = sharpness - 0.5f;
+
+    float maxScale = (sharpen_slider >= 0.0f) ? 1.25f : 1.75f;
+    float minScale = (sharpen_slider >= 0.0f) ? 1.25f : 1.0f;
+    float limitScale = (sharpen_slider >= 0.0f) ? 1.25f : 1.0f;
+
+    NISTuning t;
+    t.detectRatio = 2.0f * 1127.0f / 1024.0f;
+    t.detectThres = 64.0f / 1024.0f;
+    t.minContrastRatio = 2.0f;
+    float maxContrastRatio = 10.0f;
+
+    t.sharpStartY = 0.45f;
+    float sharpEndY = 0.9f;
+    t.sharpStrengthMin = (0.0f > 0.4f + sharpen_slider * minScale * 1.2f) ? 0.0f : 0.4f + sharpen_slider * minScale * 1.2f;
+    float sharpStrengthMax = 1.6f + sharpen_slider * maxScale * 1.8f;
+    t.sharpLimitMin = (0.1f > 0.14f + sharpen_slider * limitScale * 0.32f) ? 0.1f : 0.14f + sharpen_slider * limitScale * 0.32f;
+    float sharpLimitMax = 0.5f + sharpen_slider * limitScale * 0.6f;
+
+    t.ratioNorm = 1.0f / (maxContrastRatio - t.minContrastRatio);
+    t.sharpScaleY = 1.0f / (sharpEndY - t.sharpStartY);
+    t.sharpStrengthScale = sharpStrengthMax - t.sharpStrengthMin;
+    t.sharpLimitScale = sharpLimitMax - t.sharpLimitMin;
+    return t;
+}
+
 } // namespace
 
 bool VideoRenderer::init()
@@ -315,7 +619,8 @@ bool VideoRenderer::init()
     g_program_decode_rgba = Shader::compile_program(vertex_src, fragment_src_decode_rgba);
     g_program_easu = Shader::compile_program(vertex_src, fragment_src_easu);
     g_program_rcas = Shader::compile_program(vertex_src, fragment_src_rcas);
-    if (!g_program_decode_yuv || !g_program_decode_rgba || !g_program_easu || !g_program_rcas)
+    g_program_nis = Shader::compile_program(vertex_src, fragment_src_nis);
+    if (!g_program_decode_yuv || !g_program_decode_rgba || !g_program_easu || !g_program_rcas || !g_program_nis)
         return false;
 
     g_loc_decode_yuv_tex_y = gl::GetUniformLocation(g_program_decode_yuv, "uTexY");
@@ -331,6 +636,21 @@ bool VideoRenderer::init()
     g_loc_rcas_tex = gl::GetUniformLocation(g_program_rcas, "uTex");
     g_loc_rcas_texel_size = gl::GetUniformLocation(g_program_rcas, "uTexelSize");
     g_loc_rcas_sharpness = gl::GetUniformLocation(g_program_rcas, "uSharpness");
+    g_loc_nis_tex = gl::GetUniformLocation(g_program_nis, "uTex");
+    g_loc_nis_coef_scaler = gl::GetUniformLocation(g_program_nis, "uCoefScaler");
+    g_loc_nis_coef_usm = gl::GetUniformLocation(g_program_nis, "uCoefUSM");
+    g_loc_nis_src_size = gl::GetUniformLocation(g_program_nis, "uSrcSize");
+    g_loc_nis_texel_size = gl::GetUniformLocation(g_program_nis, "uSrcTexelSize");
+    g_loc_nis_detect_ratio = gl::GetUniformLocation(g_program_nis, "uDetectRatio");
+    g_loc_nis_detect_thres = gl::GetUniformLocation(g_program_nis, "uDetectThres");
+    g_loc_nis_min_contrast_ratio = gl::GetUniformLocation(g_program_nis, "uMinContrastRatio");
+    g_loc_nis_ratio_norm = gl::GetUniformLocation(g_program_nis, "uRatioNorm");
+    g_loc_nis_sharp_start_y = gl::GetUniformLocation(g_program_nis, "uSharpStartY");
+    g_loc_nis_sharp_scale_y = gl::GetUniformLocation(g_program_nis, "uSharpScaleY");
+    g_loc_nis_sharp_strength_min = gl::GetUniformLocation(g_program_nis, "uSharpStrengthMin");
+    g_loc_nis_sharp_strength_scale = gl::GetUniformLocation(g_program_nis, "uSharpStrengthScale");
+    g_loc_nis_sharp_limit_min = gl::GetUniformLocation(g_program_nis, "uSharpLimitMin");
+    g_loc_nis_sharp_limit_scale = gl::GetUniformLocation(g_program_nis, "uSharpLimitScale");
 
     gl::GenVertexArrays(1, &g_vao_static);
     gl::GenBuffers(1, &g_vbo_static);
@@ -372,6 +692,26 @@ bool VideoRenderer::init()
     gl::GenFramebuffers(1, &g_fbo_upscale);
     gl::GenFramebuffers(1, &g_fbo_downscale);
 
+    // NIS coefficient LUTs: 2 texels wide x 64 phases tall, RGBA32F, sampled
+    // with texelFetch (exact, filtering mode doesn't matter) - same texture
+    // layout NVIDIA's own reference uses, so the shader's texel-packing math
+    // (c0..c3 in texel 0, c4,c5 in texel 1) matches directly.
+    glGenTextures(1, &g_tex_nis_coef_scale);
+    glBindTexture(GL_TEXTURE_2D, g_tex_nis_coef_scale);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, 2, 64, 0, GL_RGBA, GL_FLOAT, nis_coef_scale);
+
+    glGenTextures(1, &g_tex_nis_coef_usm);
+    glBindTexture(GL_TEXTURE_2D, g_tex_nis_coef_usm);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, 2, 64, 0, GL_RGBA, GL_FLOAT, nis_coef_usm);
+
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
 
@@ -387,6 +727,8 @@ void VideoRenderer::destroy()
     if (g_tex_decode) glDeleteTextures(1, &g_tex_decode);
     if (g_tex_upscale) glDeleteTextures(1, &g_tex_upscale);
     if (g_tex_downscale) glDeleteTextures(1, &g_tex_downscale);
+    if (g_tex_nis_coef_scale) glDeleteTextures(1, &g_tex_nis_coef_scale);
+    if (g_tex_nis_coef_usm) glDeleteTextures(1, &g_tex_nis_coef_usm);
     if (g_fbo_decode) gl::DeleteFramebuffers(1, &g_fbo_decode);
     if (g_fbo_upscale) gl::DeleteFramebuffers(1, &g_fbo_upscale);
     if (g_fbo_downscale) gl::DeleteFramebuffers(1, &g_fbo_downscale);
@@ -398,12 +740,14 @@ void VideoRenderer::destroy()
     if (g_program_decode_rgba) gl::DeleteProgram(g_program_decode_rgba);
     if (g_program_easu) gl::DeleteProgram(g_program_easu);
     if (g_program_rcas) gl::DeleteProgram(g_program_rcas);
+    if (g_program_nis) gl::DeleteProgram(g_program_nis);
 
     g_tex_y = g_tex_u = g_tex_v = g_tex_rgba = 0;
     g_tex_decode = g_tex_upscale = g_tex_downscale = 0;
+    g_tex_nis_coef_scale = g_tex_nis_coef_usm = 0;
     g_fbo_decode = g_fbo_upscale = g_fbo_downscale = 0;
     g_vbo_static = g_vao_static = g_vbo_composite = g_vao_composite = 0;
-    g_program_decode_yuv = g_program_decode_rgba = g_program_easu = g_program_rcas = 0;
+    g_program_decode_yuv = g_program_decode_rgba = g_program_easu = g_program_rcas = g_program_nis = 0;
     g_y_w = g_y_h = g_uv_w = g_uv_h = g_rgba_w = g_rgba_h = 0;
     g_decode_w = g_decode_h = g_upscale_w = g_upscale_h = g_downscale_w = g_downscale_h = 0;
 }
@@ -598,7 +942,7 @@ void VideoRenderer::draw(const SDL_Rect &rect, int drawable_w, int drawable_h, b
 
     if (!ensure_decode_target(src_w, src_h))
         return;
-    if (g_fsr_enabled && !ensure_upscale_target(rect.w, rect.h))
+    if (g_upscaler_mode != UpscalerMode::Bilinear && !ensure_upscale_target(rect.w, rect.h))
         return;
 
     // Pass A: decode (YUV/BGRA -> RGB) into a native-resolution FBO.
@@ -627,22 +971,22 @@ void VideoRenderer::draw(const SDL_Rect &rect, int drawable_w, int drawable_h, b
     }
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
-    // Pass B: EASU-style edge-adaptive upscale into a destination-resolution
-    // FBO - skipped entirely when FSR is toggled off, so Pass C falls back
-    // to sampling the decoded frame directly (plain GL_LINEAR stretch, same
-    // quality the old SDL_Renderer path had) for a clean A/B comparison.
+    // Pass B: upscale into a destination-resolution FBO - skipped entirely
+    // in Bilinear mode, so Pass C falls back to sampling the decoded frame
+    // directly (plain GL_LINEAR stretch, same quality the old SDL_Renderer
+    // path had) for a clean A/B comparison.
     GLuint composite_source = g_tex_decode;
     float composite_sharpness = 100.0f; // exp2(-100) ~= 0: lobe forced to 0, RCAS becomes an identity passthrough
-    if (g_fsr_enabled) {
-        GLuint easu_input_tex = g_tex_decode;
-        int easu_src_w = src_w, easu_src_h = src_h;
+    if (g_upscaler_mode != UpscalerMode::Bilinear) {
+        GLuint upscale_input_tex = g_tex_decode;
+        int upscale_src_w = src_w, upscale_src_h = src_h;
 
         // Optional quality-preset pre-pass: deliberately throw away
         // resolution (a plain GL_LINEAR downsize, reusing the RCAS program
-        // with sharpness forced off as a passthrough blit) before EASU, so
-        // it has to reconstruct detail the same way it would for a game
-        // rendered at less than native resolution. Native (ratio 1.0) skips
-        // this and feeds EASU the full decoded frame.
+        // with sharpness forced off as a passthrough blit) before upscaling,
+        // so the upscaler has to reconstruct detail the same way it would
+        // for a game rendered at less than native resolution. Native (ratio
+        // 1.0) skips this and feeds the upscaler the full decoded frame.
         float scale_ratio = kRenderScalePresets[g_scale_index].ratio;
         if (scale_ratio > 1.0f) {
             int ds_w = (int)(src_w / scale_ratio + 0.5f);
@@ -662,23 +1006,50 @@ void VideoRenderer::draw(const SDL_Rect &rect, int drawable_w, int drawable_h, b
             gl::Uniform1f(g_loc_rcas_sharpness, 100.0f);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
-            easu_input_tex = g_tex_downscale;
-            easu_src_w = ds_w;
-            easu_src_h = ds_h;
+            upscale_input_tex = g_tex_downscale;
+            upscale_src_w = ds_w;
+            upscale_src_h = ds_h;
         }
 
         gl::BindFramebuffer(GL_FRAMEBUFFER, g_fbo_upscale);
         glViewport(0, 0, rect.w, rect.h);
-        gl::UseProgram(g_program_easu);
         gl::ActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, easu_input_tex);
-        gl::Uniform1i(g_loc_easu_tex, 0);
-        gl::Uniform2f(g_loc_easu_src_size, (float)easu_src_w, (float)easu_src_h);
-        gl::Uniform2f(g_loc_easu_texel_size, 1.0f / easu_src_w, 1.0f / easu_src_h);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glBindTexture(GL_TEXTURE_2D, upscale_input_tex);
 
-        composite_source = g_tex_upscale;
-        composite_sharpness = g_sharpness;
+        if (g_upscaler_mode == UpscalerMode::FSR1) {
+            gl::UseProgram(g_program_easu);
+            gl::Uniform1i(g_loc_easu_tex, 0);
+            gl::Uniform2f(g_loc_easu_src_size, (float)upscale_src_w, (float)upscale_src_h);
+            gl::Uniform2f(g_loc_easu_texel_size, 1.0f / upscale_src_w, 1.0f / upscale_src_h);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            composite_source = g_tex_upscale;
+            composite_sharpness = g_sharpness;
+        } else { // NIS
+            NISTuning nt = compute_nis_tuning(g_nis_sharpness);
+            gl::UseProgram(g_program_nis);
+            gl::ActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, g_tex_nis_coef_scale);
+            gl::ActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, g_tex_nis_coef_usm);
+            gl::Uniform1i(g_loc_nis_tex, 0);
+            gl::Uniform1i(g_loc_nis_coef_scaler, 1);
+            gl::Uniform1i(g_loc_nis_coef_usm, 2);
+            gl::Uniform2f(g_loc_nis_src_size, (float)upscale_src_w, (float)upscale_src_h);
+            gl::Uniform2f(g_loc_nis_texel_size, 1.0f / upscale_src_w, 1.0f / upscale_src_h);
+            gl::Uniform1f(g_loc_nis_detect_ratio, nt.detectRatio);
+            gl::Uniform1f(g_loc_nis_detect_thres, nt.detectThres);
+            gl::Uniform1f(g_loc_nis_min_contrast_ratio, nt.minContrastRatio);
+            gl::Uniform1f(g_loc_nis_ratio_norm, nt.ratioNorm);
+            gl::Uniform1f(g_loc_nis_sharp_start_y, nt.sharpStartY);
+            gl::Uniform1f(g_loc_nis_sharp_scale_y, nt.sharpScaleY);
+            gl::Uniform1f(g_loc_nis_sharp_strength_min, nt.sharpStrengthMin);
+            gl::Uniform1f(g_loc_nis_sharp_strength_scale, nt.sharpStrengthScale);
+            gl::Uniform1f(g_loc_nis_sharp_limit_min, nt.sharpLimitMin);
+            gl::Uniform1f(g_loc_nis_sharp_limit_scale, nt.sharpLimitScale);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            composite_source = g_tex_upscale;
+            composite_sharpness = 100.0f; // NIS bakes its own USM sharpen in; RCAS stays a passthrough
+        }
     }
 
     // Pass C: RCAS sharpen (or passthrough), drawn straight to the backbuffer at `rect`.
@@ -708,14 +1079,14 @@ void VideoRenderer::set_sharpness(float sharpness)
     g_sharpness = sharpness < 0.0f ? 0.0f : sharpness;
 }
 
-void VideoRenderer::toggle_fsr()
+void VideoRenderer::cycle_upscaler()
 {
-    g_fsr_enabled = !g_fsr_enabled;
+    g_upscaler_mode = static_cast<UpscalerMode>((static_cast<int>(g_upscaler_mode) + 1) % 3);
 }
 
-bool VideoRenderer::fsr_enabled()
+const char *VideoRenderer::upscaler_name()
 {
-    return g_fsr_enabled;
+    return kUpscalerNames[static_cast<int>(g_upscaler_mode)];
 }
 
 void VideoRenderer::cycle_render_scale()

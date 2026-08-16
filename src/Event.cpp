@@ -89,8 +89,8 @@ void Event::event_loop(VideoState *videostate)
                 // paused, it looks "overdue" and advances the frame queue.
                 // The paused branch already redraws the current frame every
                 // ~10ms regardless, so the toggle shows up on its own.
-                VideoRenderer::toggle_fsr();
-                Log::info() << "FSR upscaling " << (VideoRenderer::fsr_enabled() ? "ON" : "OFF");
+                VideoRenderer::cycle_upscaler();
+                Log::info() << "Upscaler: " << VideoRenderer::upscaler_name();
                 break;
             case SDLK_r:
                 // Same reasoning as SDLK_u above: no force_refresh, the
