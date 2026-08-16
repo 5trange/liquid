@@ -231,12 +231,14 @@ void Event::refresh_loop_wait_event(VideoState *videostate, SDL_Event *event)
         if (videostate->show_mode != SHOW_MODE_NONE && (!videostate->paused || videostate->force_refresh))
             Video::video_refresh(videostate, &remaining_time);
         
-        // Display last received frame here
-        if(videostate->paused){
-            if (videostate->video_st)
-                Video::video_image_display(videostate);
-            Video::present();
-        }
+        // Display last received frame here. Goes through video_display()
+        // (not a direct video_image_display()+present()) so the frame gets
+        // cleared first - otherwise repeated redraws while paused never
+        // erase anything outside the letterboxed video rect (e.g. the
+        // overlay toast, or the black bars for non-matching aspect ratios),
+        // since the composite pass only repaints the rect itself.
+        if(videostate->paused)
+            Video::video_display(videostate);
 
         SDL_PumpEvents();
     }

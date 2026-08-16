@@ -5,19 +5,20 @@ Lightweight media player written in C++ using FFmpeg and SDL2. Currently in deve
 
 # Upscaling
 
-Liquid renders video through a custom OpenGL pipeline (decode -> upscale -> sharpen) instead of relying on a plain bilinear stretch, and can upscale in real time using any of three upscaling algorithms, faithfully ported from their official reference implementations:
+Liquid renders video through a custom OpenGL pipeline (decode -> upscale -> sharpen) instead of relying on a plain bilinear stretch, and can upscale in real time using any of four upscaling algorithms, faithfully ported from their official reference implementations:
 
 - **AMD FidelityFX Super Resolution 1 (FSR1)** - the EASU edge-adaptive upscale pass followed by the RCAS contrast-adaptive sharpen pass, ported from AMD's MIT-licensed [`ffx_fsr1.h`](https://github.com/GPUOpen-Effects/FidelityFX-FSR).
 - **NVIDIA Image Scaling (NIS)** - NVScaler's directional-filter upscale with its built-in adaptive sharpening, ported from NVIDIA's MIT-licensed [`NIS_Scaler.h`](https://github.com/NVIDIAGameWorks/NVIDIAImageScaling).
-- **FSRCNN** - a small trained convolutional neural network (not a hand-tuned filter like the two above), run as ~44 chained fragment-shader passes since OpenGL 3.3 core has no compute shaders and a fragment shader only writes 4 channels at a time, while this network's feature maps have 56 and 12 channels. Uses real pretrained weights (Apache-2.0) from [`Saafke/FSRCNN_Tensorflow`](https://github.com/Saafke/FSRCNN_Tensorflow), the same model OpenCV's own `dnn_superres` docs point to. Unlike FSR1/NIS, it only supports a fixed 2x scale - anything else needed to fill the destination is a plain bilinear fit on top of that.
+- **FSRCNN** - a small trained convolutional neural network (not a hand-tuned filter like the others), run as ~44 chained fragment-shader passes since OpenGL 3.3 core has no compute shaders and a fragment shader only writes 4 channels at a time, while this network's feature maps have 56 and 12 channels. Uses real pretrained weights (Apache-2.0) from [`Saafke/FSRCNN_Tensorflow`](https://github.com/Saafke/FSRCNN_Tensorflow), the same model OpenCV's own `dnn_superres` docs point to. Only supports a fixed 2x scale - anything else needed to fill the destination is a plain bilinear fit on top of that.
+- **RAVU-Lite** - a RAISR-style (Rapid and Accurate Image Super Resolution) upscaler: a local gradient structure tensor is eigen-decomposed per pixel into (angle, strength, coherence), quantized into one of 288 buckets, each selecting a trained filter kernel. Ported from [`bjin/mpv-prescalers`](https://github.com/bjin/mpv-prescalers) (LGPLv3 - the one non-permissive dependency here; Liquid is GPLv2-or-later, which is compatible). Also a fixed 2x scale, same as FSRCNN.
 
-All three run as plain OpenGL 3.3 core fragment shaders (no compute shaders, so they also work on macOS, which never got OpenGL compute support), and none depend on the vendor their name suggests - FSR1 and NIS run identically on any GPU, AMD, NVIDIA, Intel, or otherwise, and FSRCNN is just a small neural net with no vendor ties at all.
+All four run as plain OpenGL 3.3 core fragment shaders (no compute shaders, so they also work on macOS, which never got OpenGL compute support), and none depend on the vendor their name suggests - FSR1 and NIS run identically on any GPU, AMD, NVIDIA, Intel, or otherwise, and FSRCNN/RAVU-Lite are just small trained models/filters with no vendor ties at all.
 
 ### Controls
 
 | Key | Action |
 | --- | --- |
-| `U` | Cycle the active upscaler: Bilinear (off) -> FSR1 (EASU + RCAS) -> NIS -> FSRCNN -> back to Bilinear |
+| `U` | Cycle the active upscaler: Bilinear (off) -> FSR1 (EASU + RCAS) -> NIS -> FSRCNN -> RAVU-Lite -> back to Bilinear |
 | `R` | Cycle the render-scale quality preset: Native -> Ultra Quality (1.3x) -> Quality (1.5x) -> Balanced (1.7x) -> Performance (2.0x) |
 
 The render-scale preset controls how much resolution is deliberately thrown away *before* the upscaler runs, then reconstructed back up to display size - the same tradeoff as picking a quality mode in a game's FSR/NIS setting, useful for judging how much detail an upscaler can actually recover at a given ratio. Native (the default) skips this and feeds the upscaler the full decoded frame.

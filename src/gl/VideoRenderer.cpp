@@ -3,6 +3,7 @@
 #include "gl/NISCoefficients.hpp"
 #include "gl/Font8x8.hpp"
 #include "gl/FSRCNNRenderer.hpp"
+#include "gl/RAVURenderer.hpp"
 #include "utils/Log.hpp"
 #include <ios>
 #include <vector>
@@ -586,9 +587,9 @@ bool g_overlay_active = false;
 float g_sharpness = 0.2f; // AMD's "stops" convention: 0.0 = max sharpness
 float g_nis_sharpness = 0.5f; // NIS's own [0,1] convention: 0.5 is its documented neutral default
 
-enum class UpscalerMode { Bilinear, FSR1, NIS, FSRCNN };
-const int kUpscalerModeCount = 4;
-const char *kUpscalerNames[] = { "Bilinear (off)", "FSR1 (EASU+RCAS)", "NIS", "FSRCNN" };
+enum class UpscalerMode { Bilinear, FSR1, NIS, FSRCNN, RAVU };
+const int kUpscalerModeCount = 5;
+const char *kUpscalerNames[] = { "Bilinear (off)", "FSR1 (EASU+RCAS)", "NIS", "FSRCNN", "RAVU-Lite" };
 UpscalerMode g_upscaler_mode = UpscalerMode::FSR1;
 
 // AMD's published FSR1 quality presets: the per-dimension ratio between the
@@ -827,6 +828,8 @@ bool VideoRenderer::init()
 
     if (!FSRCNNRenderer::init())
         return false;
+    if (!RAVURenderer::init())
+        return false;
 
     return true;
 }
@@ -834,6 +837,7 @@ bool VideoRenderer::init()
 void VideoRenderer::destroy()
 {
     FSRCNNRenderer::destroy();
+    RAVURenderer::destroy();
 
     if (g_tex_y) glDeleteTextures(1, &g_tex_y);
     if (g_tex_u) glDeleteTextures(1, &g_tex_u);
@@ -1136,18 +1140,20 @@ void VideoRenderer::draw(const SDL_Rect &rect, int drawable_w, int drawable_h, b
             upscale_src_h = ds_h;
         }
 
-        if (g_upscaler_mode == UpscalerMode::FSRCNN) {
-            // FSRCNN owns its own FBOs/textures at its own fixed-2x-scale
+        if (g_upscaler_mode == UpscalerMode::FSRCNN || g_upscaler_mode == UpscalerMode::RAVU) {
+            // Both own their own FBOs/textures at their own fixed-2x-scale
             // resolution (not rect.w x rect.h) - the composite pass below
-            // samples whatever it returns via normalized UV regardless, the
+            // samples whatever they return via normalized UV regardless, the
             // same way it already fits FSR1/NIS's rect-sized output, so no
             // extra resize step is needed here.
-            int fsrcnn_out_w = 0, fsrcnn_out_h = 0;
-            GLuint fsrcnn_out = FSRCNNRenderer::run(upscale_input_tex, upscale_src_w, upscale_src_h, fsrcnn_out_w, fsrcnn_out_h);
-            if (!fsrcnn_out)
+            int out_w = 0, out_h = 0;
+            GLuint out_tex = (g_upscaler_mode == UpscalerMode::FSRCNN)
+                ? FSRCNNRenderer::run(upscale_input_tex, upscale_src_w, upscale_src_h, out_w, out_h)
+                : RAVURenderer::run(upscale_input_tex, upscale_src_w, upscale_src_h, out_w, out_h);
+            if (!out_tex)
                 return;
-            composite_source = fsrcnn_out;
-            composite_sharpness = 100.0f; // FSRCNN is a trained SR net, not paired with a separate sharpen pass
+            composite_source = out_tex;
+            composite_sharpness = 100.0f; // both are trained SR nets/filters, not paired with a separate sharpen pass
         } else {
             gl::BindFramebuffer(GL_FRAMEBUFFER, g_fbo_upscale);
             glViewport(0, 0, rect.w, rect.h);
